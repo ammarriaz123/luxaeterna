@@ -1,1 +1,1 @@
-"""PhotometricAI model training package."""
+"""LuxAeterna model training package."""

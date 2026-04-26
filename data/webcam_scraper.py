@@ -13,7 +13,7 @@ import httpx
 import pandas as pd
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
-LOGGER = logging.getLogger("photometricai.data.webcam_scraper")
+LOGGER = logging.getLogger("luxaeterna.data.webcam_scraper")
 
 
 def _is_retryable_httpx_error(exc: BaseException) -> bool:

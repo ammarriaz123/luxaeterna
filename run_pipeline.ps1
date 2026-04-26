@@ -77,14 +77,14 @@ function Invoke-PythonStep {
 }
 
 if (-not (Test-Path $VenvPython)) {
-    Write-Host "[PhotometricAI] Creating virtual environment"
+    Write-Host "[LuxAeterna] Creating virtual environment"
     & $PythonBin -m venv $VenvDir
 }
 
 Import-EnvFile -EnvFilePath (Join-Path $RootDir ".env")
 Test-StartupConfiguration
 
-Write-Host "[PhotometricAI] Installing dependencies"
+Write-Host "[LuxAeterna] Installing dependencies"
 Invoke-PythonStep -StepName "pip upgrade" -Args @("-m", "pip", "install", "--upgrade", "pip")
 Invoke-PythonStep -StepName "dependency install" -Args @("-m", "pip", "install", "-r", "requirements.txt")
 
@@ -99,11 +99,11 @@ foreach ($dir in $dirs) {
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
 }
 
-Write-Host "[PhotometricAI] Collecting weather + solar ground truth"
+Write-Host "[LuxAeterna] Collecting weather + solar ground truth"
 Invoke-PythonStep -StepName "weather collector" -Args @("-m", "data.collector", "--lookback-hours", "$LookbackHours", "--storage", "parquet")
 
 if (-not $SkipWebcam) {
-    Write-Host "[PhotometricAI] Scraping webcam reference frames"
+    Write-Host "[LuxAeterna] Scraping webcam reference frames"
     $webcamArgs = @("-m", "data.webcam_scraper", "--days", "$WebcamDays")
     if ($env:WEBCAM_ARCHIVE_URL_TEMPLATE) {
         $webcamArgs += @("--archive-url-template", "$env:WEBCAM_ARCHIVE_URL_TEMPLATE")
@@ -112,19 +112,19 @@ if (-not $SkipWebcam) {
 }
 
 if (-not $SkipLabeller) {
-    Write-Host "[PhotometricAI] Computing ALQS labels"
+    Write-Host "[LuxAeterna] Computing ALQS labels"
     Invoke-PythonStep -StepName "ALQS labeller" -Args @("-m", "data.labeller", "--input-dir", "data/raw/webcam", "--output-path", "data/processed/alqs_labels.parquet") -ContinueOnError
 }
 
-Write-Host "[PhotometricAI] Building ML features"
+Write-Host "[LuxAeterna] Building ML features"
 Invoke-PythonStep -StepName "feature engineering" -Args @("-m", "data.feature_engineer", "--weather-path", "data/raw/weather", "--label-path", "data/processed/alqs_labels.parquet", "--output-dir", "data/processed")
 
 for ($i = 1; $i -le $TrainingLoops; $i++) {
-    Write-Host "[PhotometricAI] Training loop $i/$TrainingLoops`: LSTM"
+    Write-Host "[LuxAeterna] Training loop $i/$TrainingLoops`: LSTM"
     Invoke-PythonStep -StepName "lstm training (loop $i)" -Args @("-m", "models.lstm_predictor", "--data-path", "data/processed/sequence_dataset.npz", "--artifact-dir", "models/artifacts")
 
-    Write-Host "[PhotometricAI] Training loop $i/$TrainingLoops`: MLP recommender"
+    Write-Host "[LuxAeterna] Training loop $i/$TrainingLoops`: MLP recommender"
     Invoke-PythonStep -StepName "mlp training (loop $i)" -Args @("-m", "models.mlp_recommender", "--features-path", "data/processed/classifier_features.parquet", "--artifact-dir", "models/artifacts")
 }
 
-Write-Host "[PhotometricAI] Pipeline complete"
+Write-Host "[LuxAeterna] Pipeline complete"

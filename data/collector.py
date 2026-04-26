@@ -15,7 +15,7 @@ import httpx
 import pandas as pd
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-LOGGER = logging.getLogger("photometricai.data.collector")
+LOGGER = logging.getLogger("luxaeterna.data.collector")
 
 
 @dataclass(slots=True)
@@ -234,7 +234,7 @@ async def collect_recent_weather(
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="PhotometricAI weather and solar collector")
+    parser = argparse.ArgumentParser(description="LuxAeterna weather and solar collector")
     parser.add_argument("--lat", type=float, default=float(os.getenv("PHOTO_LAT", "40.7128")))
     parser.add_argument("--lon", type=float, default=float(os.getenv("PHOTO_LON", "-74.0060")))
     parser.add_argument("--lookback-hours", type=int, default=72)

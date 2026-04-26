@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 import pandas as pd
 
-LOGGER = logging.getLogger("photometricai.data.labeller")
+LOGGER = logging.getLogger("luxaeterna.data.labeller")
 
 
 @dataclass(slots=True)

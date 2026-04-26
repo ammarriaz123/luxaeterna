@@ -1,1 +1,1 @@
-"""PhotometricAI data engineering package."""
+"""LuxAeterna data engineering package."""

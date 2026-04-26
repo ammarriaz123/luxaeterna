@@ -1,10 +1,10 @@
-# PhotometricAI
+# LuxAeterna
 
 Enterprise-grade machine learning backend for predicting Atmospheric Light Quality Score (ALQS) and recommending photography genres from weather, time-series, and visual context.
 
 ## Overview
 
-PhotometricAI is organized as a modular mono-repo with three core domains:
+LuxAeterna is organized as a modular mono-repo with three core domains:
 
 - data: data engineering, external API ingestion, webcam collection, ALQS label creation, and feature engineering
 - models: time-series regression (LSTM) and multi-class recommendation (MLP)
@@ -253,8 +253,8 @@ Train models first with run_pipeline.ps1 (TrainingLoops >= 1), then restart API.
 Build and run:
 
 ```bash
-docker build -t photometricai .
-docker run -p 8000:8000 photometricai
+docker build -t luxaeterna .
+docker run -p 8000:8000 luxaeterna
 ```
 
 The Dockerfile defines volumes for:

@@ -1,1 +1,1 @@
-"""PhotometricAI serving API package."""
+"""LuxAeterna serving API package."""

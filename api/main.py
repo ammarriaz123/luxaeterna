@@ -30,7 +30,7 @@ from api.schemas import (
 )
 from data.collector import collect_recent_weather
 
-LOGGER = logging.getLogger("photometricai.api")
+LOGGER = logging.getLogger("luxaeterna.api")
 
 
 @dataclass(slots=True)
@@ -127,7 +127,7 @@ async def lifespan(_: FastAPI):
         LOGGER.info("API lifespan shutdown complete")
 
 
-app = FastAPI(title="PhotometricAI", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="LuxAeterna", version="1.0.0", lifespan=lifespan)
 
 
 def _require_registry() -> ModelRegistry:

@@ -12,7 +12,7 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
 
-LOGGER = logging.getLogger("photometricai.data.feature_engineer")
+LOGGER = logging.getLogger("luxaeterna.data.feature_engineer")
 
 CONTINUOUS_FEATURES = [
     "cloud_cover_low",
@@ -291,7 +291,7 @@ def build_sequence_dataset(
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Build PhotometricAI sequence and classifier features")
+    parser = argparse.ArgumentParser(description="Build LuxAeterna sequence and classifier features")
     parser.add_argument("--weather-path", default="data/raw/weather")
     parser.add_argument("--label-path", default="data/processed/alqs_labels.parquet")
     parser.add_argument("--output-dir", default="data/processed")

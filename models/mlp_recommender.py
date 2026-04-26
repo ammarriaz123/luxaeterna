@@ -17,7 +17,7 @@ from sklearn.preprocessing import LabelEncoder, MinMaxScaler, OneHotEncoder
 from sklearn.utils.class_weight import compute_class_weight
 from tensorflow import keras
 
-LOGGER = logging.getLogger("photometricai.models.mlp_recommender")
+LOGGER = logging.getLogger("luxaeterna.models.mlp_recommender")
 
 GENRE_CLASSES = ["landscape", "golden_hour", "night_astro", "street", "moody"]
 WEATHER_STATES = ["clear", "partly_cloudy", "cloudy", "rain", "fog", "snow", "storm", "unknown"]
@@ -86,7 +86,7 @@ def build_model(input_dim: int, learning_rate: float) -> keras.Model:
     x = keras.layers.BatchNormalization()(x)
     outputs = keras.layers.Dense(5, activation="softmax")(x)
 
-    model = keras.Model(inputs=inputs, outputs=outputs, name="photometricai_mlp_recommender")
+    model = keras.Model(inputs=inputs, outputs=outputs, name="luxaeterna_mlp_recommender")
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
         loss="categorical_crossentropy",
@@ -211,7 +211,7 @@ def train(config: MlpTrainingConfig) -> dict[str, float]:
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train PhotometricAI MLP recommender")
+    parser = argparse.ArgumentParser(description="Train LuxAeterna MLP recommender")
     parser.add_argument("--features-path", default="data/processed/classifier_features.parquet")
     parser.add_argument("--artifact-dir", default="models/artifacts")
     parser.add_argument("--epochs", type=int, default=80)

@@ -11,7 +11,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 
-LOGGER = logging.getLogger("photometricai.models.lstm_predictor")
+LOGGER = logging.getLogger("luxaeterna.models.lstm_predictor")
 
 
 @dataclass(slots=True)
@@ -47,7 +47,7 @@ def build_model(input_shape: tuple[int, int], learning_rate: float) -> keras.Mod
             keras.layers.Dense(32, activation="relu"),
             keras.layers.Dense(1, activation="linear"),
         ],
-        name="photometricai_lstm_predictor",
+        name="luxaeterna_lstm_predictor",
     )
 
     model.compile(
@@ -165,7 +165,7 @@ def train(config: LstmTrainingConfig) -> dict[str, float]:
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train PhotometricAI LSTM predictor")
+    parser = argparse.ArgumentParser(description="Train LuxAeterna LSTM predictor")
     parser.add_argument("--data-path", default="data/processed/sequence_dataset.npz")
     parser.add_argument("--artifact-dir", default="models/artifacts")
     parser.add_argument("--epochs", type=int, default=120)
