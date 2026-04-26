@@ -1,4 +1,4 @@
-# PhotometricAI
+# LuxAeterna
 
 Enterprise-grade machine learning backend for predicting Atmospheric Light Quality Score (ALQS) and recommending photography genres from weather, time-series, and visual context.
 
