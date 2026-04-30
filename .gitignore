@@ -36,6 +36,7 @@ logs/
 models/artifacts/
 data/raw/
 data/processed/
+data/webcams.json
 
 # OS files
 .DS_Store

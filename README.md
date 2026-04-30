@@ -27,7 +27,9 @@ The system is designed for practical MLOps workflows:
 |   `-- __init__.py
 |-- data/
 |   |-- collector.py
+|   |-- global_ingestion.py
 |   |-- webcam_scraper.py
+|   |-- webcam_discovery.py
 |   |-- labeller.py
 |   |-- feature_engineer.py
 |   `-- __init__.py
@@ -51,6 +53,7 @@ The system is designed for practical MLOps workflows:
 
 - Asynchronous weather ingestion from Open-Meteo and optional OpenWeatherMap enrichment
 - Solar geometry (elevation and azimuth) via PyEphem
+- Global webcam discovery and sampling for scalable dataset creation
 - Webcam frame retrieval near sunrise/sunset windows
 - OpenCV-based ALQS scoring from saturation, contrast, and warm-hue ratio
 - 6-hour sliding window dataset generation with stratified train/val/test split
@@ -85,11 +88,13 @@ Optional:
 
 Important variables:
 
-- OPENWEATHERMAP_API_KEY: optional, enables OWM enrichment
-- PHOTO_LAT and PHOTO_LON: location for weather and solar calculations
-- WEBCAM_ARCHIVE_URL_TEMPLATE: optional URL with {timestamp} placeholder
+- SAMPLE_SIZE: number of webcams sampled per global ingestion run
+- MAX_WEBCAMS: optional cap for discovery cache size
+- DATA_OUTPUT_PATH: dataset output directory or file path
+- WEBCAMS_API_KEY: optional discovery provider API key (if required)
+- OPENWEATHERMAP_API_KEY: optional, enables OWM enrichment (legacy local pipeline)
+- PHOTO_LAT and PHOTO_LON: location for legacy local pipeline and API defaults
 - INGEST_INTERVAL_SECONDS: API background ingestion interval
-- INGEST_STORAGE: parquet or sqlite
 
 Security note:
 
@@ -113,23 +118,30 @@ Useful options:
 
 # Fast local test with no training loops
 .\run_pipeline.ps1 -TrainingLoops 0 -LookbackHours 24 -WebcamDays 1
+
+# Enable legacy local pipeline (single location/webcam)
+.\run_pipeline.ps1 -LegacyLocalPipeline
 ```
 
 What the pipeline does:
 
 1. Creates/uses .venv
 2. Installs dependencies
-3. Collects weather + solar ground truth
-4. Optionally scrapes webcam frames
-5. Optionally computes ALQS labels
-6. Builds sequence and classifier features
-7. Trains LSTM and MLP models (if TrainingLoops > 0)
+3. Discovers global webcams and caches metadata
+4. Samples webcams and builds a global dataset with image + weather pairing
+5. (Optional) Legacy local pipeline for single-location training
 
 ## Quickstart (Bash)
 
 ```bash
 chmod +x run_pipeline.sh
 ./run_pipeline.sh
+```
+
+Legacy local pipeline (single location/webcam) can be enabled with:
+
+```bash
+LEGACY_LOCAL_PIPELINE=1 ./run_pipeline.sh
 ```
 
 ## Start the API
