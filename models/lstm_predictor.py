@@ -123,9 +123,9 @@ def train(config: LstmTrainingConfig) -> dict[str, float]:
 
     savedmodel_path = config.artifact_dir / "lstm_predictor_savedmodel"
     try:
-        model.export(savedmodel_path)
-    except Exception:
-        tf.saved_model.save(model, str(savedmodel_path))
+        model.export(str(savedmodel_path))
+    except Exception as e:
+        LOGGER.warning("Could not export SavedModel natively: %s. Keras standard save was successful.", e)
 
     metadata = {
         "model_name": model.name,
