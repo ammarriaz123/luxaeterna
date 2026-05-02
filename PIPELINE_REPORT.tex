@@ -1,0 +1,445 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf-8]{inputenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{fancyhdr}
+\usepackage{hyperref}
+
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{LuxAeterna LSTM Pipeline Report}
+\lhead{May 2, 2026}
+\cfoot{\thepage}
+
+\title{\textbf{LuxAeterna: Global Webcam Light Quality Prediction}\\
+\Large Data Ingestion, Preprocessing, Feature Engineering, Training \& Results}
+\author{Automated ML Pipeline}
+\date{May 2, 2026}
+
+\begin{document}
+
+\maketitle
+
+\section{Executive Summary}
+
+This report documents the complete machine learning pipeline for predicting ALQS (Air Light Quality Score, 0--100) from global webcam time-series data and weather observations. The pipeline ingests multi-webcam observations, constructs irregular time-series sequences, and trains an LSTM predictor.
+
+\begin{center}
+\Large\textbf{\textcolor{red}{RESULT: FAILURE}}\\
+Model performance is \textbf{worse than persistence baseline}.\\
+No meaningful signal captured beyond autocorrelation.
+\end{center}
+
+\section{1. Data Ingestion}
+
+\subsection{1.1 Webcam Discovery}
+
+\begin{itemize}
+    \item \textbf{Provider:} Windy v3 API
+    \item \textbf{Target:} 1,000 global webcams
+    \item \textbf{Method:} Grid-based geographic sweep using 24 seed locations (every 30--60° latitude/longitude)
+    \item \textbf{Result:} Successfully cached exactly 1,000 unique webcams
+    \item \textbf{API Key:} Required; loaded from \texttt{.env}
+\end{itemize}
+
+\subsection{1.2 Data Collection}
+
+\begin{itemize}
+    \item \textbf{Duration:} ~13 hours per webcam (approximately 26 timesteps)
+    \item \textbf{Interval:} Intended ~30 minutes; actual intervals irregular (15--45 minutes observed)
+    \item \textbf{Sampling Rate:} 2 samples per hour target $\times$ 1,000 webcams $\times$ ~13 hours
+    \item \textbf{Ingestion Pipeline:} Global background worker; asynchronous batch processing (50 webcams/batch)
+    \item \textbf{Image Storage:} Local JPEG files per date/webcam
+    \item \textbf{Weather Source:} Open-Meteo API (archive + forecast blend)
+    \item \textbf{Output Format:} Multiple Parquet files in \texttt{data/processed/global\_dataset/}
+\end{itemize}
+
+\subsection{1.3 Raw Data Statistics}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lr}
+\toprule
+\textbf{Metric} & \textbf{Value} \\
+\midrule
+Total Rows (Initial Load) & 26,233 \\
+Total Parquet Files & ~461 \\
+Unique Webcams & 1,000 \\
+Rows per Webcam (avg) & 26.2 \\
+Temporal Span & 13.0 hours \\
+\bottomrule
+\end{tabular}
+\caption{Raw ingestion dataset overview.}
+\end{table}
+
+\subsection{1.4 Data Columns}
+
+\begin{itemize}
+    \item \texttt{timestamp}: UTC observation time (datetime64[ns])
+    \item \texttt{webcam\_id}: Unique webcam identifier (string)
+    \item \texttt{latitude, longitude}: Geographic coordinates (float)
+    \item \texttt{image\_path}: Local file path to JPEG (string)
+    \item \texttt{alqs}: Target light quality score 0--100 (float)
+    \item \texttt{temperature}: Air temperature °C (float)
+    \item \texttt{relative\_humidity}: Humidity \% (float)
+    \item \texttt{visibility}: Horizontal visibility meters (float, sometimes null)
+    \item \texttt{cloud\_cover\_low, cloud\_cover\_mid, cloud\_cover\_high}: Cloud cover \% by layer (float)
+    \item \texttt{weather\_code}: WMO weather code (int)
+\end{itemize}
+
+\section{2. Preprocessing \& Data Cleaning}
+
+\subsection{2.1 Cleaning Pipeline}
+
+\begin{enumerate}
+    \item \textbf{Timestamp Normalization:} Converted all timestamp columns to UTC datetime64. Handled multiple input formats (seconds, milliseconds, datetime strings).
+    
+    \item \textbf{Missing Value Handling:}
+    \begin{itemize}
+        \item Dropped rows with missing critical fields: \texttt{alqs, temperature, relative\_humidity, cloud\_cover\_low}
+        \item Imputed \texttt{visibility} with dataset median (10,000 meters when no valid median)
+        \item Dropped rows with invalid \texttt{webcam\_id, timestamp}
+    \end{itemize}
+    
+    \item \textbf{Coordinate Validation:} Enforced $-90 \leq \text{latitude} \leq 90$ and $-180 \leq \text{longitude} \leq 180$.
+    
+    \item \textbf{Deduplication:} Removed duplicate (webcam\_id, timestamp) pairs; kept last observation.
+    
+    \item \textbf{Rows After Cleaning:} 26,233 $\rightarrow$ 26,233 (0 rows dropped---data quality was excellent).
+\end{enumerate}
+
+\subsection{2.2 Derived Features}
+
+\begin{itemize}
+    \item \textbf{total\_cloud\_cover:} $\text{cloud\_cover\_low} + \text{cloud\_cover\_mid} + \text{cloud\_cover\_high}$
+    \item \textbf{delta\_time\_minutes:} Seconds elapsed since previous observation within same webcam, converted to minutes. Median imputation across gaps (30 min assumed).
+\end{itemize}
+
+\section{3. Feature Engineering \& Sequence Construction}
+
+\subsection{3.1 Per-Webcam Grouping \& Sorting}
+
+\begin{itemize}
+    \item \textbf{Grouping:} Strictly partitioned dataset by \texttt{webcam\_id}. No cross-webcam mixing.
+    \item \textbf{Sorting:} Within each group, sorted by \texttt{timestamp} ascending.
+    \item \textbf{Irregular Intervals:} Preserved natural time gaps; did NOT resample to fixed frequency.
+\end{itemize}
+
+\subsection{3.2 Sliding Window Construction}
+
+\begin{itemize}
+    \item \textbf{Window Size:} 12 timesteps (~6 hours at 30-min intervals)
+    \item \textbf{Input (X):} Previous 12 observations
+    \item \textbf{Target (y):} ALQS at the next timestep (t+1)
+    \item \textbf{Features per Timestep:}
+    \begin{enumerate}
+        \item temperature
+        \item relative\_humidity
+        \item cloud\_cover\_low
+        \item cloud\_cover\_mid
+        \item cloud\_cover\_high
+        \item weather\_code
+        \item visibility
+        \item total\_cloud\_cover
+        \item delta\_time\_minutes
+    \end{enumerate}
+    \textbf{Total:} 9 features
+\end{itemize}
+
+\subsection{3.3 Sequence Statistics}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lr}
+\toprule
+\textbf{Metric} & \textbf{Count} \\
+\midrule
+Total Sequences Built & 14,233 \\
+Unique Webcams Contributing & 1,000 \\
+Sequences Skipped (< 13 timesteps) & 0 \\
+Sequences Skipped (missing data) & 0 \\
+\bottomrule
+\end{tabular}
+\caption{Sequence construction summary.}
+\end{table}
+
+\subsection{3.4 Feature Scaling}
+
+\begin{itemize}
+    \item \textbf{Scaler:} MinMaxScaler (sklearn)
+    \item \textbf{Fit:} On all 14,233 sequences combined
+    \item \textbf{Range:} [0, 1]
+    \item \textbf{Saved:} \texttt{data/processed/feature\_artifacts.joblib}
+    \item \textbf{Inverse Transform:} Available for inference
+\end{itemize}
+
+\section{4. Train/Validation/Test Split}
+
+\subsection{4.1 Split Strategy}
+
+\textbf{Objective:} Prevent data leakage from same webcam appearing in multiple partitions.
+
+\begin{itemize}
+    \item \textbf{Split Basis:} Webcam ID (not random sequences)
+    \item \textbf{Ratio:} 70\% train, 15\% validation, 15\% test
+    \item \textbf{Allocation:}
+    \begin{itemize}
+        \item Train webcams: 700 / 1,000 (70.0\%)
+        \item Validation webcams: 150 / 1,000 (15.0\%)
+        \item Test webcams: 150 / 1,000 (15.0\%)
+    \end{itemize}
+\end{itemize}
+
+\subsection{4.2 Split Distribution}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrr}
+\toprule
+\textbf{Partition} & \textbf{Webcams} & \textbf{Sequences} \\
+\midrule
+Train & 700 & 9,968 \\
+Validation & 150 & 2,137 \\
+Test & 150 & 2,128 \\
+\midrule
+\textbf{Total} & \textbf{1,000} & \textbf{14,233} \\
+\bottomrule
+\end{tabular}
+\caption{Train/validation/test split breakdown.}
+\end{table}
+
+\section{5. Model Architecture \& Training}
+
+\subsection{5.1 LSTM Architecture}
+
+\begin{lstlisting}[language=Python, basicstyle=\ttfamily\small]
+Input: (batch, 12 timesteps, 9 features)
+  |
+  v
+LSTM Layer 1: 128 units, return_sequences=True
+  Dropout: 0.2
+  |
+  v
+LSTM Layer 2: 64 units, return_sequences=False
+  Dropout: 0.2
+  |
+  v
+Dense Layer: 32 units, ReLU activation
+  |
+  v
+Output Layer: 1 unit, Linear activation (regression)
+\end{lstlisting}
+
+\subsection{5.2 Training Configuration}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Optimizer & Adam \\
+Initial Learning Rate & 0.001 \\
+Loss Function & Mean Squared Error (MSE) \\
+Batch Size & 64 \\
+Max Epochs & 120 \\
+Early Stopping Patience & 10 \\
+ReduceLROnPlateau Patience & 5 \\
+Validation Set Monitor & val\_loss \\
+\bottomrule
+\end{tabular}
+\caption{Training hyperparameters.}
+\end{table}
+
+\subsection{5.3 Training Progress}
+
+\begin{itemize}
+    \item \textbf{Epochs Completed:} 33 / 120 (early stopped)
+    \item \textbf{Learning Rate Schedule:}
+    \begin{enumerate}
+        \item Epochs 1--20: $\eta = 0.001$
+        \item Epochs 21--27: $\eta = 0.0005$ (reduced at epoch 21)
+        \item Epochs 28--32: $\eta = 0.00025$ (reduced at epoch 28)
+        \item Epoch 33: $\eta = 0.000125$ (early stop triggered)
+    \end{enumerate}
+    \item \textbf{Best Validation Loss:} 93.40 (epoch 23)
+    \item \textbf{Convergence:} Model stabilized after epoch 2; marginal improvement thereafter
+\end{itemize}
+
+\section{6. Results \& Evaluation}
+
+\subsection{6.1 Test Set Performance}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrr}
+\toprule
+\textbf{Metric} & \textbf{LSTM Model} & \textbf{Persistence Baseline} \\
+\midrule
+Mean Absolute Error (MAE) & 7.88 & 3.21 \\
+Mean Squared Error (MSE) & 99.98 & 33.80 \\
+RMSE & 9.999 & 5.82 \\
+\bottomrule
+\end{tabular}
+\caption{Test set metrics: LSTM vs. persistence baseline.}
+\end{table}
+
+\subsection{6.2 Detailed Evaluation}
+
+\begin{enumerate}
+    \item \textbf{Model MAE:} 7.88 ALQS points
+    \item \textbf{Baseline MAE:} 3.21 ALQS points (predicting $y_t = y_{t-1}$)
+    \item \textbf{MAE Improvement:} $\frac{3.21 - 7.88}{3.21} \times 100 = -145.21\%$ \\
+    \quad $\Rightarrow$ \textcolor{red}{\textbf{Model performs 145\% WORSE than baseline}}
+    \item \textbf{Model MSE:} 99.98 $(\text{ALQS}^2)$
+    \item \textbf{Baseline MSE:} 33.80 $(\text{ALQS}^2)$
+    \item \textbf{MSE Ratio:} $\frac{99.98}{33.80} = 2.96\times$ worse
+    \item \textbf{Residual Std Dev:} 9.999 ALQS points
+\end{enumerate}
+
+\subsection{6.3 Target Achievement}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Target} & \textbf{Threshold} & \textbf{Result} \\
+\midrule
+MAE $< 12$ & 12.0 & $7.88 < 12$ \quad \textcolor{green}{\checkmark PASS} \\
+Baseline Improvement $> 20\%$ & 20.0\% & $-145.21\%$ \quad \textcolor{red}{\times FAIL} \\
+\bottomrule
+\end{tabular}
+\caption{Target metrics vs. achievement.}
+\end{table}
+
+\section{7. Analysis \& Interpretation}
+
+\subsection{7.1 Why Did the Model Underperform?}
+
+\begin{enumerate}
+    \item \textbf{Strong Autocorrelation Signal:}
+    The persistence baseline (predicting $y_t = y_{t-1}$) achieves MAE $= 3.21$. This indicates ALQS values are highly correlated within short (30-min) timescales. The LSTM cannot exploit additional weather features to beat this prior.
+    
+    \item \textbf{Insufficient Temporal Dynamics:}
+    With only 26 observations per webcam over 13 hours, the model sees limited state transitions. ALQS likely exhibits slow dynamics (photometric changes across hours/days), not captured by the 12-step (6-hour) window.
+    
+    \item \textbf{Weak Weather Coupling:}
+    Weather features (temperature, cloud cover, visibility) show weak predictive power for ALQS changes. Photometric quality is driven by:
+    \begin{itemize}
+        \item Solar geometry (time of day, latitude, season) -- \emph{not} in current features
+        \item Scene-specific factors (urban, rural, altitude) -- \emph{not} available
+        \item Image quality artifacts (lens, ISO, white balance) -- \emph{not} measured
+    \end{itemize}
+    Current weather proxies are insufficient.
+    
+    \item \textbf{Limited Training Horizon:}
+    Model trained on 9,968 sequences. While substantial, insufficient to learn complex weather--photometry interactions with only 13-hour temporal context per webcam.
+    
+    \item \textbf{Outlier Sensitivity:}
+    High residual std (9.999) suggests the model produces wild predictions on occasional sequences, dragging average error higher.
+\end{enumerate}
+
+\subsection{7.2 Data Quality Assessment}
+
+\begin{itemize}
+    \item \textbf{Completeness:} Excellent. Zero rows dropped during cleaning. All critical fields present.
+    \item \textbf{Consistency:} Good. Geographic coordinates valid. Timestamps normalized cleanly.
+    \item \textbf{Representativeness:} Fair. 1,000 webcams globally distributed. However, only 13-hour window per webcam limits temporal dynamics.
+    \item \textbf{Signal Strength:} \textcolor{red}{\textbf{WEAK}}. ALQS signal is dominated by intra-hour autocorrelation, not exogenous weather features.
+\end{itemize}
+
+\subsection{7.3 Meaningful Signal Captured?}
+
+\textcolor{red}{\textbf{NO.}} The model captures \textbf{no meaningful signal} beyond the trivial persistence baseline. Evidence:
+
+\begin{itemize}
+    \item The baseline (simply copying the previous value) is \textbf{2.46$\times$ better in MAE}.
+    \item The model's residuals (std $\approx 10$) are large relative to the ALQS range (0--100).
+    \item Zero improvement on 20\% MAE reduction target. Target not only missed but inverted.
+\end{itemize}
+
+\section{8. Model Quality Assessment}
+
+\subsection{8.1 Verdict: \textcolor{red}{\textbf{USELESS}}}
+
+\begin{center}
+\Large
+\begin{tabular}{|c|}
+\hline
+\textbf{Model Status: } \textcolor{red}{\textbf{REJECTED}} \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{8.2 Justification}
+
+\begin{enumerate}
+    \item \textbf{Worse than Baseline:} The model is 145\% worse than a trivial baseline (predict last value). No practitioner would deploy it.
+    
+    \item \textbf{No Learned Structure:} The LSTM fails to extract meaningful patterns from weather features. The network is essentially learning to output values close to the input window mean, which does not beat persistence.
+    
+    \item \textbf{Impractical for Production:} Any system using this model for real-time ALQS prediction should simply use the previous observed value instead.
+    
+    \item \textbf{Data Regime Too Short:} 13-hour windows are insufficient to capture photometric dynamics. A full 24--72 hour per-webcam dataset is needed to observe meaningful day/night cycles and weather transitions.
+\end{enumerate}
+
+\subsection{8.3 Recommendations for Improvement}
+
+\begin{enumerate}
+    \item \textbf{Extended Collection Window:} Ingest $\geq$48--72 hours per webcam at 30-min intervals. Observe full day/night cycles and weather transitions.
+    
+    \item \textbf{Add Solar Features:} Include computed solar elevation, azimuth, and clear-sky index using PyEphem. These are strong ALQS drivers.
+    
+    \item \textbf{Longer Sequences:} Use 24--48 timesteps (12--24 hours) to capture diurnal patterns.
+    
+    \item \textbf{Ensemble Baselines:} Compare against multiple baselines (seasonal naive, moving average, exponential smoothing) before claiming LSTM superiority.
+    
+    \item \textbf{Scene-Specific Normalization:} Stratify by webcam latitude/longitude and image metadata to account for persistent scene differences.
+    
+    \item \textbf{Explicit Causality:} Lag weather features relative to ALQS (weather at time $t$, ALQS at time $t+\Delta$) to capture true causal delays.
+    
+    \item \textbf{Attention Mechanism:} Replace standard LSTM with Attention-based architecture to identify which features/timesteps matter most.
+\end{enumerate}
+
+\section{9. Conclusion}
+
+The LuxAeterna LSTM pipeline successfully:
+
+\begin{itemize}
+    \item[\checkmark] Ingested 1,000 global webcams
+    \item[\checkmark] Constructed 14,233 irregular time-series sequences
+    \item[\checkmark] Built and trained an LSTM model end-to-end
+    \item[\checkmark] Achieved MAE below 12 on test set
+\end{itemize}
+
+However, the model:
+
+\begin{itemize}
+    \item[\times] Fails to beat trivial persistence baseline (145\% worse)
+    \item[\times] Does not capture meaningful photometric--weather signals
+    \item[\times] Is unsuitable for production deployment
+    \item[\times] Requires substantially more data and feature engineering
+\end{itemize}
+
+\textbf{Overall Assessment:} \textcolor{red}{\textbf{FAILURE}}. The current data collection window (13 hours per webcam) is too short to reveal meaningful temporal dynamics. A redesign with 48--72 hour collection per location, solar features, and longer sequences is essential before re-attempting model development.
+
+\newpage
+
+\section{Appendix: Key File Locations}
+
+\begin{itemize}
+    \item \textbf{Webcam Cache:} \texttt{data/webcams.json} (1,000 entries)
+    \item \textbf{Raw Dataset:} \texttt{data/processed/global\_dataset/*.parquet} (\textasciitilde461 files)
+    \item \textbf{Processed Sequences:} \texttt{data/processed/sequence\_dataset.npz}
+    \item \textbf{Feature Artifacts:} \texttt{data/processed/feature\_artifacts.joblib}
+    \item \textbf{Feature Metadata:} \texttt{data/processed/feature\_metadata.json}
+    \item \textbf{Trained Model:} \texttt{models/artifacts/lstm\_predictor.keras}
+    \item \textbf{Training Metadata:} \texttt{models/artifacts/lstm\_metadata.json}
+\end{itemize}
+
+\end{document}

@@ -280,8 +280,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-alqs", action="store_true")
     parser.add_argument("--refresh-cache", action="store_true")
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--interval", type=int, default=int(os.getenv("INGEST_INTERVAL_SECONDS", "1800")), help="Interval in seconds between ingestion cycles")
-    parser.add_argument("--max-cycles", type=int, default=None, help="Maximum number of cycles to run")
+    parser.add_argument("--interval", type=int, default=int(os.getenv("INGEST_INTERVAL_SECONDS", "3600")), help="Interval in seconds between ingestion cycles (default: 3600 = 1 hour)")
+    parser.add_argument("--max-cycles", type=int, default=72, help="Maximum number of cycles to run (default: 72 for 72-hour collection)")
     return parser
 
 

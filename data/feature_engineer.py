@@ -4,8 +4,10 @@ import argparse
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
+import ephem
 import joblib
 import numpy as np
 import pandas as pd
@@ -27,6 +29,9 @@ BASE_FEATURES = [
 DERIVED_FEATURES = [
     "total_cloud_cover",
     "delta_time_minutes",
+    "solar_elevation",
+    "solar_azimuth",
+    "clear_sky_index",
 ]
 
 FEATURE_COLUMNS = BASE_FEATURES + DERIVED_FEATURES
@@ -139,6 +144,62 @@ def _clean_frame(frame: pd.DataFrame, max_visibility_fill: float = 10000.0) -> p
     return frame
 
 
+def _compute_solar_geometry(frame: pd.DataFrame) -> pd.DataFrame:
+    """Compute solar elevation, azimuth, and clear-sky index for each observation."""
+    frame = frame.copy()
+    
+    elevations = []
+    azimuths = []
+    clear_sky_indices = []
+    
+    for idx, row in frame.iterrows():
+        try:
+            if pd.isna(row.get("timestamp")) or pd.isna(row.get("latitude")) or pd.isna(row.get("longitude")):
+                elevations.append(np.nan)
+                azimuths.append(np.nan)
+                clear_sky_indices.append(np.nan)
+                continue
+            
+            # Create observer at webcam location
+            observer = ephem.Observer()
+            observer.lat = str(float(row["latitude"]))
+            observer.lon = str(float(row["longitude"]))
+            observer.date = pd.Timestamp(row["timestamp"]).to_pydatetime()
+            
+            # Compute solar position
+            sun = ephem.Sun(observer)
+            elevation_rad = float(sun.alt)
+            azimuth_rad = float(sun.az)
+            
+            # Convert from radians to degrees
+            elevation_deg = np.degrees(elevation_rad)
+            azimuth_deg = np.degrees(azimuth_rad)
+            
+            elevations.append(elevation_deg)
+            azimuths.append(azimuth_deg)
+            
+            # Clear-sky index: normalized solar elevation
+            # Ranges from 0 (sun below horizon) to 1 (sun at zenith, clear sky)
+            clear_sky = max(0.0, np.sin(elevation_rad))
+            clear_sky_indices.append(clear_sky)
+            
+        except Exception as e:
+            LOGGER.debug(f"Solar geometry computation failed at index {idx}: {e}")
+            elevations.append(np.nan)
+            azimuths.append(np.nan)
+            clear_sky_indices.append(np.nan)
+    
+    frame["solar_elevation"] = elevations
+    frame["solar_azimuth"] = azimuths
+    frame["clear_sky_index"] = clear_sky_indices
+    
+    # Forward fill missing values per webcam to maintain continuity
+    for col in ["solar_elevation", "solar_azimuth", "clear_sky_index"]:
+        frame[col] = frame.groupby("webcam_id")[col].fillna(method="ffill").groupby("webcam_id").fillna(method="bfill")
+    
+    return frame
+
+
 def _build_webcam_splits(webcam_ids: list[str]) -> tuple[set[str], set[str], set[str]]:
     ids = np.array(sorted(set(webcam_ids)))
     if len(ids) < 3:
@@ -227,6 +288,10 @@ def build_sequence_dataset(
 
     raw = _read_weather_frame(weather_path)
     frame = _clean_frame(raw)
+    
+    # Add solar geometry features
+    LOGGER.info("Computing solar geometry features (elevation, azimuth, clear-sky index)...")
+    frame = _compute_solar_geometry(frame)
 
     x, y, baseline_prev, seq_webcam_ids, seq_target_timestamps = _build_sequences(
         frame=frame,
@@ -298,7 +363,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build LuxAeterna sequence features from global webcam data")
     parser.add_argument("--weather-path", default="data/processed/global_dataset")
     parser.add_argument("--output-dir", default="data/processed")
-    parser.add_argument("--window-size", type=int, default=12)
+    parser.add_argument("--window-size", type=int, default=24, help="Sliding window size in timesteps (default: 24 = 24 hours at 1-hour intervals)")
     return parser
 
 
