@@ -24,19 +24,10 @@ dist/
 .vscode/
 .idea/
 
-# Environment variables and secrets
-.env
-.env.*
 
-# Logs
-logs/
-*.log
 
-# ML artifacts and generated datasets
-models/artifacts/
-data/raw/
-data/processed/
-data/webcams.json
+
+
 
 # OS files
 .DS_Store
