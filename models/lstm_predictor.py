@@ -62,6 +62,10 @@ def evaluate_persistence_baseline(y_true: np.ndarray, y_pred_persistence: np.nda
     return float(np.mean(np.abs(y_true - y_pred_persistence)))
 
 
+def evaluate_persistence_baseline_mse(y_true: np.ndarray, y_pred_persistence: np.ndarray) -> float:
+    return float(np.mean((y_true - y_pred_persistence) ** 2))
+
+
 def train(config: LstmTrainingConfig) -> dict[str, float]:
     dataset = load_dataset(config.data_path)
 
@@ -113,7 +117,9 @@ def train(config: LstmTrainingConfig) -> dict[str, float]:
     y_pred = model.predict(x_test, verbose=0).reshape(-1)
     model_mae = float(np.mean(np.abs(y_test - y_pred)))
     baseline_mae = evaluate_persistence_baseline(y_test, baseline_prev_test)
+    baseline_mse = evaluate_persistence_baseline_mse(y_test, baseline_prev_test)
     improvement_pct = (baseline_mae - model_mae) / max(baseline_mae, 1e-8) * 100.0
+    model_mse = float(np.mean((y_test - y_pred) ** 2))
 
     residual_std = float(np.std(y_test - y_pred))
 
@@ -134,9 +140,12 @@ def train(config: LstmTrainingConfig) -> dict[str, float]:
         "metrics": {
             "test_loss": float(eval_metrics.get("loss", 0.0)),
             "test_mae": float(eval_metrics.get("mae", model_mae)),
+            "test_mse": model_mse,
             "baseline_mae": baseline_mae,
+            "baseline_mse": baseline_mse,
             "mae_improvement_pct": improvement_pct,
             "target_improvement_met": bool(improvement_pct > 20.0),
+            "mae_target_lt_12": bool(model_mae < 12.0),
             "residual_std": residual_std,
         },
         "history": {
@@ -158,7 +167,9 @@ def train(config: LstmTrainingConfig) -> dict[str, float]:
 
     return {
         "test_mae": model_mae,
+        "test_mse": model_mse,
         "baseline_mae": baseline_mae,
+        "baseline_mse": baseline_mse,
         "improvement_pct": improvement_pct,
         "residual_std": residual_std,
     }
