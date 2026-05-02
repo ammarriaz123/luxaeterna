@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+import sys
 
 import cv2
 import httpx
@@ -17,6 +18,9 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from data.labeller import compute_alqs
 from data.webcam_discovery import WebcamMeta, ensure_webcam_cache, iter_webcam_cache
@@ -143,15 +147,22 @@ async def _fetch_weather_for_timestamp(
         "timezone": "UTC",
     }
 
-    payload = await _safe_get(client, OPEN_METEO_ARCHIVE_URL, params)
-    frame = _payload_to_frame(payload)
-    weather = _select_nearest_weather(frame, timestamp, max_delta_minutes)
-    if weather is not None:
-        return weather
+    try:
+        payload = await _safe_get(client, OPEN_METEO_FORECAST_URL, params)
+        frame = _payload_to_frame(payload)
+        weather = _select_nearest_weather(frame, timestamp, max_delta_minutes)
+        if weather is not None:
+            return weather
+    except Exception as exc:
+        LOGGER.debug("Forecast API failed: %s. Falling back to archive.", exc)
 
-    payload = await _safe_get(client, OPEN_METEO_FORECAST_URL, params)
-    frame = _payload_to_frame(payload)
-    return _select_nearest_weather(frame, timestamp, max_delta_minutes)
+    try:
+        payload = await _safe_get(client, OPEN_METEO_ARCHIVE_URL, params)
+        frame = _payload_to_frame(payload)
+        return _select_nearest_weather(frame, timestamp, max_delta_minutes)
+    except Exception as exc:
+        LOGGER.warning("Archive API also failed: %s", exc)
+        return None
 
 
 def _validate_location(meta: WebcamMeta) -> bool:
@@ -211,6 +222,7 @@ async def _process_webcam(
             "alqs": alqs,
         }
         row.update(weather)
+        meta.usage_count += 1
         return row
 
 
@@ -268,7 +280,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-alqs", action="store_true")
     parser.add_argument("--refresh-cache", action="store_true")
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--interval", type=int, default=int(os.getenv("INGEST_INTERVAL_SECONDS", "60")), help="Interval in seconds between ingestion batches")
+    parser.add_argument("--interval", type=int, default=int(os.getenv("INGEST_INTERVAL_SECONDS", "1800")), help="Interval in seconds between ingestion cycles")
     parser.add_argument("--max-cycles", type=int, default=None, help="Maximum number of cycles to run")
     return parser
 
@@ -330,19 +342,16 @@ def main() -> None:
     )
 
     try:
-        LOGGER.info("Checking and expanding webcam pool to maintain global diversity...")
-        from data.webcam_discovery import expand_webcam_pool
-        pool_size = expand_webcam_pool(
+        ensure_webcam_cache(
             cache_path=config.cache_path,
-            target_count=1000,
+            max_webcams=config.max_webcams,
+            refresh=config.refresh_cache,
             api_key=os.getenv("WEBCAMS_API_KEY"),
         )
-        LOGGER.info("Webcam pool ready. Size: %d", pool_size)
     except Exception as exc:
-        LOGGER.error("Failed to initialize or expand webcam cache: %s", exc)
+        LOGGER.error("Failed to initialize webcam cache: %s", exc)
         return
 
-    # Valid webcams from cache
     valid_webcams = []
     for meta in iter_webcam_cache(config.cache_path):
         if meta.webcam_id and meta.image_url and _validate_location(meta):
@@ -352,7 +361,7 @@ def main() -> None:
         LOGGER.error("No valid webcams found in cache. Cannot start ingestion.")
         return
 
-    LOGGER.info("Loaded %d valid webcams from registry.", len(valid_webcams))
+    LOGGER.info("Loaded %d valid webcams from cache.", len(valid_webcams))
 
     rng = random.Random(args.seed)
     
@@ -369,51 +378,39 @@ def main() -> None:
             
             LOGGER.info("Starting ingestion cycle %d with %d webcams", cycles + 1, len(valid_webcams))
             
-            # Recalculate weights based on usage_count for this cycle
-            # We want to heavily prefer historically underused webcams
-            weights = [1.0 / (1.0 + getattr(wc, 'usage_count', 0)) for wc in valid_webcams]
+            # Shuffle offline pool to ensure random unique selection per batch
+            rng.shuffle(valid_webcams)
             
-            # Since user wants 10 per cycle, ignore old batching entirely
-            # config.sample_size should be explicitly 10 as per API constraints
-            cycle_sample_size = min(10, len(valid_webcams))
-            
-            # Perform Weighted Random Sampling without replacement
-            # random.choices does replacement natively, so we simulate without replacement:
-            import copy
-            pool_copy = list(zip(valid_webcams, weights))
-            
-            selected_batch = []
-            for _ in range(cycle_sample_size):
-                if not pool_copy:
-                    break
-                w_list = [w for _, w in pool_copy]
-                chosen = random.choices(pool_copy, weights=w_list, k=1)[0]
-                selected_batch.append(chosen[0])
-                pool_copy.remove(chosen)
+            # Split webcams into batches
+            batches = [
+                valid_webcams[i : i + config.sample_size]
+                for i in range(0, len(valid_webcams), config.sample_size)
+            ]
             
             cycle_successes = 0
             cycle_failures = 0
             
-            LOGGER.info("Processing cycle %d (%d selected webcams via weighted sampling)", cycles + 1, len(selected_batch))
-            try:
-                successes, failures = ingest_batch(selected_batch, config)
-            except Exception as e:
-                LOGGER.error("Unexpected error during batch: %s", e, exc_info=True)
-                successes, failures = 0, 0
+            for i, batch in enumerate(batches):
+                LOGGER.info("Processing cycle %d, batch %d/%d (%d webcams)", cycles + 1, i + 1, len(batches), len(batch))
+                try:
+                    successes, failures = ingest_batch(batch, config)
+                except Exception as e:
+                    LOGGER.error("Unexpected error during batch: %s", e, exc_info=True)
+                    successes, failures = 0, 0
+                cycle_successes += successes
+                cycle_failures += failures
                 
-            cycle_successes += successes
-            cycle_failures += failures
-            
-            # Update usage counts
-            for wc in selected_batch:
-                wc.usage_count = getattr(wc, 'usage_count', 0) + 1
-            
-            # Persist updated usage count back to json 
-            with config.cache_path.open("w", encoding="utf-8") as handle:
+            # Rewrite the webcams cache file with updated usage counts
+            try:
                 import json
-                for wc in valid_webcams:
-                    handle.write(json.dumps(wc.to_dict()) + "\n")
-                    
+                temp_path = config.cache_path.with_suffix(".json.tmp")
+                with open(temp_path, "w", encoding="utf-8") as f:
+                    for meta in valid_webcams:
+                        f.write(json.dumps(meta.to_dict()) + "\n")
+                temp_path.replace(config.cache_path)
+            except Exception as e:
+                LOGGER.error("Failed to update cache usage counts: %s", e)
+
             execution_time = time.monotonic() - start_time
             
             LOGGER.info(

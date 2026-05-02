@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import httpx
+from dotenv import load_dotenv
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 LOGGER = logging.getLogger("luxaeterna.data.webcam_discovery")
@@ -24,18 +25,15 @@ WINDY_API_BASES = [
 
 DEFAULT_DISCOVERY_RADIUS_KM = 250
 DEFAULT_DISCOVERY_SEEDS = [
-    (40.7128, -74.0060),
-    (51.5074, -0.1278),
-    (35.6762, 139.6503),
-    (1.3521, 103.8198),
-    (48.8566, 2.3522),
-    (-33.8688, 151.2093),
-    (-23.5505, -46.6333),
-    (19.4326, -99.1332),
-    (30.0444, 31.2357),
-    (-33.9249, 18.4241),
-    (37.7749, -122.4194),
-    (55.7558, 37.6173),
+    # Global sweep coordinates (approx every 60 degrees longitude, 30 degrees latitude)
+    (60.0, -120.0), (60.0, -60.0), (60.0, 0.0), (60.0, 60.0), (60.0, 120.0), (60.0, 180.0),
+    (30.0, -120.0), (30.0, -60.0), (30.0, 0.0), (30.0, 60.0), (30.0, 120.0), (30.0, 180.0),
+    (0.0, -120.0), (0.0, -60.0), (0.0, 0.0), (0.0, 60.0), (0.0, 120.0), (0.0, 180.0),
+    (-30.0, -120.0), (-30.0, -60.0), (-30.0, 0.0), (-30.0, 60.0), (-30.0, 120.0), (-30.0, 180.0),
+    # Additional high density areas (Europe, North America, Japan)
+    (40.7128, -74.0060), (34.0522, -118.2437), (41.8781, -87.6298),
+    (51.5074, -0.1278), (48.8566, 2.3522), (41.9028, 12.4964), (52.5200, 13.4050),
+    (35.6762, 139.6503), (34.6937, 135.5023),
 ]
 
 
@@ -256,36 +254,41 @@ async def _discover_windy_to_cache(
     cache_path: Path,
     max_webcams: int,
     api_key: str | None,
-    page_limit: int = 100,
+    page_limit: int = 50,
 ) -> int:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    total_written = 0
-    offset = 0
+    
     seen_ids: set[str] = set()
+    mode = "a" if cache_path.exists() else "w"
+    
+    # Pre-populate seen_ids from existing cache to prevent duplicates when appending
+    if cache_path.exists():
+        try:
+            for meta in iter_webcam_cache(cache_path):
+                seen_ids.add(meta.webcam_id)
+        except Exception:
+            pass
+
+    total_written = 0
 
     async with httpx.AsyncClient(timeout=30) as client:
-        with cache_path.open("w", encoding="utf-8") as handle:
+        with cache_path.open(mode, encoding="utf-8") as handle:
             if api_key:
-                params = {
-                    "radius": DEFAULT_DISCOVERY_RADIUS_KM,
-                    "include": "images,player,location",
-                }
                 v3_failed = False
                 for lat, lon in DEFAULT_DISCOVERY_SEEDS:
                     if total_written >= max_webcams or v3_failed:
                         break
-                    params["lat"] = lat
-                    params["lon"] = lon
+                        
+                    LOGGER.info("Sweeping webcams near %s, %s", lat, lon)
                     offset = 0
-                    pagination_supported = True
-
+                    
                     while total_written < max_webcams:
-                        if pagination_supported:
-                            params["limit"] = page_limit
-                            params["offset"] = offset
-                        else:
-                            params.pop("limit", None)
-                            params.pop("offset", None)
+                        params = {
+                            "nearby": f"{lat},{lon},{DEFAULT_DISCOVERY_RADIUS_KM}",
+                            "limit": page_limit,
+                            "offset": offset,
+                            "include": "location",
+                        }
 
                         try:
                             payload = await _safe_get_v3(client, WINDY_V3_ENDPOINT, params, api_key)
@@ -295,193 +298,61 @@ async def _discover_windy_to_cache(
                                 LOGGER.warning("Windy v3 auth failed (%s); falling back.", status_code)
                                 v3_failed = True
                                 break
-                            if status_code in {400, 404} and pagination_supported:
-                                LOGGER.warning("Windy v3 pagination not supported; retrying without limit/offset.")
-                                pagination_supported = False
-                                continue
                             if status_code in {400, 404}:
-                                LOGGER.warning("Windy v3 request failed (%s): %s", status_code, exc)
-                                break
+                                break # Usually means end of pagination or invalid parameters
                             raise
 
-                        webcams = _parse_windy_v3_payload(payload)
+                        webcams = payload.get("webcams", [])
                         if not webcams:
                             break
 
                         new_added = 0
-                        for meta in webcams:
-                            if meta.webcam_id in seen_ids:
+                        for entry in webcams:
+                            webcam_id = str(entry.get("webcamId", ""))
+                            if not webcam_id or webcam_id in seen_ids:
                                 continue
-                            seen_ids.add(meta.webcam_id)
-                            handle.write(json.dumps(meta.to_dict()) + "\n")
-                            total_written += 1
-                            new_added += 1
-                            if total_written >= max_webcams:
-                                break
+                                
+                            image_url = f"https://imgproxy.windy.com/_/preview/plain/current/{webcam_id}/original.jpg"
+                            w_lat = entry.get("location", {}).get("latitude")
+                            w_lon = entry.get("location", {}).get("longitude")
+                            
+                            if w_lat is None or w_lon is None:
+                                continue
+                                
+                            meta = WebcamMeta(
+                                webcam_id=webcam_id,
+                                image_url=image_url,
+                                latitude=float(w_lat),
+                                longitude=float(w_lon),
+                                provider="windy_v3",
+                            )
+                            
+                            if _is_valid(meta):
+                                seen_ids.add(meta.webcam_id)
+                                d = meta.to_dict()
+                                d["usage_count"] = 0
+                                handle.write(json.dumps(d) + "\n")
+                                new_added += 1
+                                total_written += 1
+                                
+                                if total_written >= max_webcams:
+                                    break
 
-                        if new_added == 0:
-                            break
-
-                        if not pagination_supported or len(webcams) < page_limit:
+                        if new_added == 0 or len(webcams) < page_limit:
                             break
 
                         offset += page_limit
-
-            if total_written == 0:
-                params_base = {
-                    "show": "webcams:location,images",
-                }
-                if api_key:
-                    params_base["key"] = api_key
-
-            while True:
-                if total_written > 0:
-                    break
-
-                params = dict(params_base)
-                payload = None
-                last_error: httpx.HTTPStatusError | None = None
-                for base_url in WINDY_API_BASES:
-                    url = f"{base_url}/limit={page_limit},{offset}"
-                    try:
-                        payload = await _safe_get(client, url, params)
-                        break
-                    except httpx.HTTPStatusError as exc:
-                        if exc.response.status_code == 404:
-                            last_error = exc
-                            continue
-                        raise
-
-                if payload is None:
-                    if last_error is not None:
-                        raise last_error
-                    break
-                webcams = _parse_windy_payload(payload)
-                if not webcams:
-                    break
-
-                for meta in webcams:
-                    if meta.webcam_id in seen_ids:
-                        continue
-                    seen_ids.add(meta.webcam_id)
-                    handle.write(json.dumps(meta.to_dict()) + "\n")
-                    total_written += 1
-                    if total_written >= max_webcams:
-                        break
-
-                if total_written >= max_webcams:
-                    break
-
-                if len(webcams) < page_limit:
-                    break
-
-                offset += page_limit
+                        await asyncio.sleep(0.5)
 
     return total_written
 
-
-def expand_webcam_pool(
-    cache_path: Path,
-    target_count: int = 1000,
-    api_key: str | None = None,
-) -> int:
-    """Continues bootstrapping webcams using radius-based queries until pool size is met."""
-    if not api_key:
-        api_key = os.getenv("WEBCAMS_API_KEY")
-        
-    seen_ids = set()
-    webcams = []
-    
-    if cache_path.exists():
-        for meta in iter_webcam_cache(cache_path):
-            if _is_valid(meta):
-                seen_ids.add(meta.webcam_id)
-                webcams.append(meta)
-                
-    start_count = len(webcams)
-    LOGGER.info("Pool currently has %d unique webcams", start_count)
-    
-    if start_count >= target_count:
-        LOGGER.info("Pool already at or above target (%d >= %d).", start_count, target_count)
-    
-    # We will expand regardless, running random radius searches
-    # to slowly add more coverage
-    
-    async def _fetch_from_coords() -> int:
-        nonlocal webcams, seen_ids
-        added_in_session = 0
-        
-        # Predefined grid of major land masses to avoid empty oceans for bootstrapping
-        land_seeds = [
-            (47.0, 8.0), (35.0, 139.0), (40.0, -74.0), (51.0, -0.1), (-33.0, 151.0), 
-            (48.8, 2.3), (-23.0, -46.0), (19.0, -99.0), (30.0, 31.0), (-33.9, 18.4),
-            (37.7, -122.4), (55.0, 37.0), (60.0, 10.0), (41.9, 13.8), (40.0, -5.0),
-            (50.0, 13.0), (66.5, 25.7), (45.0, -93.0), (34.0, -118.0), (43.0, -79.0),
-            (52.0, 4.0), (41.0, 28.0), (13.0, 77.0), (31.0, 121.0), (22.0, 114.0),
-            (25.0, 55.0), (39.0, 116.0), (1.0, 103.0), (-37.0, 144.0), (-36.0, 174.0)
-        ]
-        
-        async with httpx.AsyncClient(timeout=30) as client:
-            import random
-            # Just hit all land seeds up to target limit to quickly populate
-            target_seeds = random.sample(land_seeds, min(30, len(land_seeds)))
-            for (lat, lon) in target_seeds:
-                params = {
-                    "lat": lat,
-                    "lon": lon,
-                    "radius": 500, # Large radius
-                    "include": "images,location",
-                }
-                try:
-                    payload = await _safe_get_v3(client, WINDY_V3_ENDPOINT, params, api_key)
-                    
-                    webcams_list = payload.get("webcams", [])
-                    for entry in webcams_list:
-                        wid = entry.get("webcamId")
-                        loc = entry.get("location", {})
-                        lat_val = loc.get("latitude")
-                        lon_val = loc.get("longitude")
-                        images_entry = entry.get("images", {})
-                        current_image = images_entry.get("current", {})
-                        img_url = current_image.get("preview") or current_image.get("thumbnail")
-                        
-                        if wid and lat_val is not None and lon_val is not None and img_url:
-                            wid_str = str(wid)
-                            if wid_str not in seen_ids:
-                                seen_ids.add(wid_str)
-                                webcams.append(WebcamMeta(
-                                    webcam_id=wid_str,
-                                    image_url=img_url,
-                                    latitude=float(lat_val),
-                                    longitude=float(lon_val),
-                                    provider="windy_v3",
-                                ))
-                                added_in_session += 1
-                                
-                    await asyncio.sleep(0.5)
-                except httpx.HTTPError:
-                    pass
-                    
-        return added_in_session
-
-    if api_key:
-        added = asyncio.run(_fetch_from_coords())
-        LOGGER.info("Expanded pool by %d webcams (Total: %d)", added, len(webcams))
-    
-    # Rewrite the registry purely with NDJSON to ensure schema updates (like usage tracking) hold
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    with cache_path.open("w", encoding="utf-8") as handle:
-        for meta in webcams:
-            handle.write(json.dumps(meta.to_dict()) + "\n")
-            
-    return len(webcams)
 
 def ensure_webcam_cache(
     cache_path: Path,
     max_webcams: int,
     refresh: bool = False,
     api_key: str | None = None,
-    page_limit: int = 100,
+    page_limit: int = 50,
 ) -> int:
     if cache_path.exists() and not refresh:
         if cache_path.stat().st_size > 0 and _cache_has_entries(cache_path):
@@ -554,13 +425,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Discover global webcams and cache metadata")
     parser.add_argument("--cache-path", default="data/webcams.json")
     parser.add_argument("--max-webcams", type=int, default=1000)
-    parser.add_argument("--page-limit", type=int, default=100)
+    parser.add_argument("--page-limit", type=int, default=50)
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--api-key", default=os.getenv("WEBCAMS_API_KEY"))
     return parser
 
 
 def main() -> None:
+    load_dotenv()
     configure_logging()
     args = _build_arg_parser().parse_args()
     cache_path = Path(args.cache_path)

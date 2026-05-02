@@ -10,45 +10,43 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
+from sklearn.preprocessing import MinMaxScaler
 
 LOGGER = logging.getLogger("luxaeterna.data.feature_engineer")
 
-CONTINUOUS_FEATURES = [
+BASE_FEATURES = [
+    "temperature",
+    "relative_humidity",
     "cloud_cover_low",
     "cloud_cover_mid",
     "cloud_cover_high",
-    "relative_humidity",
-    "pm25",
+    "weather_code",
     "visibility",
-    "temperature",
 ]
 
-WEATHER_STATE_MAP = {
-    0: "clear",
-    1: "clear",
-    2: "partly_cloudy",
-    3: "cloudy",
-    45: "fog",
-    48: "fog",
-    51: "drizzle",
-    53: "drizzle",
-    55: "drizzle",
-    61: "rain",
-    63: "rain",
-    65: "rain",
-    71: "snow",
-    73: "snow",
-    75: "snow",
-    95: "storm",
-}
+DERIVED_FEATURES = [
+    "total_cloud_cover",
+    "delta_time_minutes",
+]
+
+FEATURE_COLUMNS = BASE_FEATURES + DERIVED_FEATURES
+
+CRITICAL_COLUMNS = [
+    "webcam_id",
+    "timestamp",
+    "alqs",
+    "temperature",
+    "relative_humidity",
+    "cloud_cover_low",
+    "cloud_cover_mid",
+    "cloud_cover_high",
+    "weather_code",
+]
 
 
 @dataclass(slots=True)
 class FeatureArtifacts:
-    scaler: MinMaxScaler
-    weather_encoder: OneHotEncoder
-    alqs_scaler: MinMaxScaler
+    feature_scaler: MinMaxScaler
 
 
 def _read_weather_frame(weather_path: Path) -> pd.DataFrame:
@@ -59,243 +57,248 @@ def _read_weather_frame(weather_path: Path) -> pd.DataFrame:
         frames = [pd.read_parquet(path) for path in paths]
         return pd.concat(frames, ignore_index=True)
 
-    if weather_path.suffix == ".db":
-        import sqlite3
-
-        with sqlite3.connect(weather_path) as conn:
-            frame = pd.read_sql_query("SELECT * FROM weather_observations", conn)
-        return frame
-
     if weather_path.suffix == ".parquet":
         return pd.read_parquet(weather_path)
 
     raise ValueError(f"Unsupported weather source: {weather_path}")
 
 
-def _assign_weather_state(frame: pd.DataFrame) -> pd.DataFrame:
+def _normalize_timestamp_column(frame: pd.DataFrame, col: str) -> pd.Series:
+    series = frame.get(col)
+    if series is None:
+        return pd.Series(pd.NaT, index=frame.index)
+
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return pd.to_datetime(series, utc=True, errors="coerce")
+
+    numeric = pd.to_numeric(series, errors="coerce")
+    if numeric.notna().sum() > 0:
+        max_val = float(numeric.dropna().abs().max())
+        # Heuristic: values above 1e11 are likely UNIX milliseconds.
+        unit = "ms" if max_val > 1e11 else "s"
+        return pd.to_datetime(numeric, unit=unit, utc=True, errors="coerce")
+
+    return pd.to_datetime(series, utc=True, errors="coerce")
+
+
+def _clean_frame(frame: pd.DataFrame, max_visibility_fill: float = 10000.0) -> pd.DataFrame:
     frame = frame.copy()
-    frame["weather_code"] = frame.get("weather_code", pd.Series(np.nan, index=frame.index))
-    frame["weather_state"] = frame["weather_code"].map(WEATHER_STATE_MAP).fillna("unknown")
+
+    missing_columns = [col for col in CRITICAL_COLUMNS if col not in frame.columns]
+    if missing_columns:
+        raise ValueError(f"Dataset missing required columns: {missing_columns}")
+
+    frame["timestamp"] = _normalize_timestamp_column(frame, "timestamp")
+    if "weather_timestamp" in frame.columns:
+        frame["weather_timestamp"] = _normalize_timestamp_column(frame, "weather_timestamp")
+
+    for col in [
+        "alqs",
+        "temperature",
+        "relative_humidity",
+        "cloud_cover_low",
+        "cloud_cover_mid",
+        "cloud_cover_high",
+        "weather_code",
+        "visibility",
+        "latitude",
+        "longitude",
+    ]:
+        if col in frame.columns:
+            frame[col] = pd.to_numeric(frame[col], errors="coerce")
+
+    before_drop = len(frame)
+    frame = frame.dropna(subset=CRITICAL_COLUMNS)
+
+    if "latitude" in frame.columns and "longitude" in frame.columns:
+        frame = frame[
+            frame["latitude"].between(-90.0, 90.0)
+            & frame["longitude"].between(-180.0, 180.0)
+        ]
+
+    if "visibility" not in frame.columns:
+        frame["visibility"] = np.nan
+
+    visibility_median = frame["visibility"].median(skipna=True)
+    if pd.isna(visibility_median):
+        visibility_median = max_visibility_fill
+    frame["visibility"] = frame["visibility"].fillna(float(visibility_median))
+
+    frame["total_cloud_cover"] = (
+        frame["cloud_cover_low"] + frame["cloud_cover_mid"] + frame["cloud_cover_high"]
+    )
+
+    frame = frame.drop_duplicates(subset=["webcam_id", "timestamp"], keep="last")
+
+    LOGGER.info(
+        "Dropped %d rows during cleaning; %d rows remain",
+        before_drop - len(frame),
+        len(frame),
+    )
+
     return frame
 
 
-def _merge_with_labels(weather_df: pd.DataFrame, label_path: Path) -> pd.DataFrame:
-    weather_df = weather_df.copy()
-    weather_df["timestamp"] = pd.to_datetime(weather_df["timestamp"], utc=True, errors="coerce")
-    weather_df = weather_df.dropna(subset=["timestamp"]).sort_values("timestamp")
+def _build_webcam_splits(webcam_ids: list[str]) -> tuple[set[str], set[str], set[str]]:
+    ids = np.array(sorted(set(webcam_ids)))
+    if len(ids) < 3:
+        raise ValueError("Need at least 3 unique webcams for train/val/test split")
 
-    if not label_path.exists():
-        synthetic = weather_df[["timestamp"]].copy()
-        synthetic["alqs"] = np.clip(50 + 0.2 * weather_df.get("solar_elevation", 0).fillna(0), 0, 100)
-        labels = synthetic
-    else:
-        labels = pd.read_parquet(label_path)
-        labels["timestamp"] = pd.to_datetime(labels["timestamp"], utc=True, errors="coerce")
-        labels = labels.dropna(subset=["timestamp", "alqs"]).sort_values("timestamp")
+    train_ids, rem_ids = train_test_split(ids, test_size=0.30, random_state=42, shuffle=True)
+    val_ids, test_ids = train_test_split(rem_ids, test_size=0.50, random_state=42, shuffle=True)
 
-    merged = pd.merge_asof(
-        weather_df,
-        labels[["timestamp", "alqs"]],
-        on="timestamp",
-        direction="nearest",
-        tolerance=pd.Timedelta("30min"),
+    return set(train_ids.tolist()), set(val_ids.tolist()), set(test_ids.tolist())
+
+
+def _build_sequences(
+    frame: pd.DataFrame,
+    window_size: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str], list[pd.Timestamp]]:
+    x_seq: list[np.ndarray] = []
+    y_seq: list[float] = []
+    y_prev: list[float] = []
+    seq_webcam_ids: list[str] = []
+    seq_target_timestamps: list[pd.Timestamp] = []
+
+    grouped = frame.groupby("webcam_id", sort=False)
+
+    skipped_short = 0
+    skipped_missing = 0
+
+    for webcam_id, group in grouped:
+        group = group.sort_values("timestamp").copy()
+
+        # Irregular-interval signal: elapsed minutes from previous timestamp.
+        group["delta_time_minutes"] = group["timestamp"].diff().dt.total_seconds().div(60.0)
+        median_delta = group["delta_time_minutes"].median(skipna=True)
+        if pd.isna(median_delta):
+            median_delta = 30.0
+        group["delta_time_minutes"] = group["delta_time_minutes"].fillna(float(median_delta))
+
+        group = group.dropna(subset=FEATURE_COLUMNS + ["alqs"])
+
+        if len(group) < (window_size + 1):
+            skipped_short += 1
+            continue
+
+        values = group[FEATURE_COLUMNS].to_numpy(dtype=np.float32)
+        targets = group["alqs"].to_numpy(dtype=np.float32)
+        timestamps = group["timestamp"].to_numpy()
+
+        for end_idx in range(window_size, len(group)):
+            start_idx = end_idx - window_size
+            x_window = values[start_idx:end_idx]
+            if x_window.shape[0] != window_size:
+                skipped_missing += 1
+                continue
+
+            x_seq.append(x_window)
+            y_seq.append(float(targets[end_idx]))
+            y_prev.append(float(targets[end_idx - 1]))
+            seq_webcam_ids.append(str(webcam_id))
+            seq_target_timestamps.append(pd.Timestamp(timestamps[end_idx]))
+
+    LOGGER.info(
+        "Built %d sequences across %d webcams (skipped short=%d, skipped malformed=%d)",
+        len(x_seq),
+        frame["webcam_id"].nunique(),
+        skipped_short,
+        skipped_missing,
     )
-    merged["alqs"] = merged["alqs"].interpolate(limit_direction="both")
-    merged = merged.dropna(subset=["alqs"]).reset_index(drop=True)
-    return merged
 
+    if not x_seq:
+        raise ValueError("No valid sequences built. Check data quality and window size.")
 
-def _resample_to_15min(frame: pd.DataFrame) -> pd.DataFrame:
-    frame = frame.set_index("timestamp").sort_index()
-    numeric_cols = frame.select_dtypes(include=[np.number]).columns.tolist()
-    other_cols = [col for col in frame.columns if col not in numeric_cols]
-
-    resampled_numeric = frame[numeric_cols].resample("15min").interpolate(method="time").ffill().bfill()
-    if other_cols:
-        resampled_other = frame[other_cols].resample("15min").ffill().bfill()
-        frame = pd.concat([resampled_numeric, resampled_other], axis=1).sort_index()
-    else:
-        frame = resampled_numeric
-
-    return frame.reset_index()
-
-
-def _safe_split_indices(y: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    if len(y) < 20:
-        raise ValueError("Not enough samples to create 70/15/15 split; need at least 20 sequence samples")
-
-    indices = np.arange(len(y))
-    try:
-        strata = pd.qcut(y, q=5, labels=False, duplicates="drop")
-        if len(np.unique(strata)) < 2:
-            raise ValueError("Insufficient quintile diversity")
-    except Exception:
-        jitter = y + np.random.default_rng(42).normal(0, 1e-6, size=len(y))
-        strata = pd.qcut(jitter, q=5, labels=False, duplicates="drop")
-
-    strata_arr = np.asarray(strata)
-
-    try:
-        train_idx, rem_idx = train_test_split(
-            indices,
-            test_size=0.30,
-            random_state=42,
-            stratify=strata_arr,
-        )
-    except ValueError:
-        train_idx, rem_idx = train_test_split(
-            indices,
-            test_size=0.30,
-            random_state=42,
-            stratify=None,
-        )
-
-    rem_strata = strata_arr[rem_idx]
-    try:
-        val_idx, test_idx = train_test_split(
-            rem_idx,
-            test_size=0.50,
-            random_state=42,
-            stratify=rem_strata,
-        )
-    except ValueError:
-        val_idx, test_idx = train_test_split(
-            rem_idx,
-            test_size=0.50,
-            random_state=42,
-            stratify=None,
-        )
-    return train_idx, val_idx, test_idx
+    return (
+        np.asarray(x_seq, dtype=np.float32),
+        np.asarray(y_seq, dtype=np.float32),
+        np.asarray(y_prev, dtype=np.float32),
+        seq_webcam_ids,
+        seq_target_timestamps,
+    )
 
 
 def build_sequence_dataset(
     weather_path: Path,
-    label_path: Path,
     output_dir: Path,
-    window_size: int = 24,
+    window_size: int = 12,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    weather_df = _read_weather_frame(weather_path)
-    weather_df = _assign_weather_state(weather_df)
-    merged = _merge_with_labels(weather_df, label_path)
-    merged = _resample_to_15min(merged)
+    raw = _read_weather_frame(weather_path)
+    frame = _clean_frame(raw)
 
-    for feature in CONTINUOUS_FEATURES:
-        merged[feature] = pd.to_numeric(
-            merged.get(feature, pd.Series(np.nan, index=merged.index)),
-            errors="coerce",
-        )
-        if merged[feature].isna().all():
-            merged[feature] = 0.0
-        else:
-            merged[feature] = merged[feature].interpolate(limit_direction="both").ffill().bfill()
+    x, y, baseline_prev, seq_webcam_ids, seq_target_timestamps = _build_sequences(
+        frame=frame,
+        window_size=window_size,
+    )
 
-    merged["hour"] = merged["timestamp"].dt.hour + merged["timestamp"].dt.minute / 60.0
-    merged["sin_time"] = np.sin(2 * np.pi * merged["hour"] / 24.0)
-    merged["cos_time"] = np.cos(2 * np.pi * merged["hour"] / 24.0)
+    feature_scaler = MinMaxScaler()
+    original_shape = x.shape
+    x_2d = x.reshape(-1, x.shape[-1])
+    x_scaled = feature_scaler.fit_transform(x_2d).reshape(original_shape).astype(np.float32)
 
-    weather_encoder = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
-    weather_encoder.fit(merged[["weather_state"]])
+    train_webcams, val_webcams, test_webcams = _build_webcam_splits(seq_webcam_ids)
 
-    scaler = MinMaxScaler()
-    scaled_continuous = scaler.fit_transform(merged[CONTINUOUS_FEATURES])
+    train_idx = np.array([i for i, w in enumerate(seq_webcam_ids) if w in train_webcams], dtype=np.int64)
+    val_idx = np.array([i for i, w in enumerate(seq_webcam_ids) if w in val_webcams], dtype=np.int64)
+    test_idx = np.array([i for i, w in enumerate(seq_webcam_ids) if w in test_webcams], dtype=np.int64)
 
-    alqs_scaler = MinMaxScaler()
-    merged["alqs_norm"] = alqs_scaler.fit_transform(merged[["alqs"]])
-
-    x_seq: list[np.ndarray] = []
-    y_seq: list[float] = []
-    y_prev: list[float] = []
-    seq_times: list[str] = []
-    weather_state_for_y: list[str] = []
-    sin_time_for_y: list[float] = []
-    cos_time_for_y: list[float] = []
-
-    for idx in range(window_size, len(merged)):
-        x_seq.append(scaled_continuous[idx - window_size : idx])
-        y_seq.append(float(merged.iloc[idx]["alqs"]))
-        y_prev.append(float(merged.iloc[idx - 1]["alqs"]))
-        seq_times.append(merged.iloc[idx]["timestamp"].isoformat())
-        weather_state_for_y.append(str(merged.iloc[idx]["weather_state"]))
-        sin_time_for_y.append(float(merged.iloc[idx]["sin_time"]))
-        cos_time_for_y.append(float(merged.iloc[idx]["cos_time"]))
-
-    x = np.asarray(x_seq, dtype=np.float32)
-    y = np.asarray(y_seq, dtype=np.float32)
-    baseline_prev = np.asarray(y_prev, dtype=np.float32)
-
-    train_idx, val_idx, test_idx = _safe_split_indices(y)
+    if len(train_idx) == 0 or len(val_idx) == 0 or len(test_idx) == 0:
+        raise ValueError("Split produced an empty partition; cannot continue")
 
     np.savez_compressed(
         output_dir / "sequence_dataset.npz",
-        X_train=x[train_idx],
+        X_train=x_scaled[train_idx],
         y_train=y[train_idx],
-        X_val=x[val_idx],
+        X_val=x_scaled[val_idx],
         y_val=y[val_idx],
-        X_test=x[test_idx],
+        X_test=x_scaled[test_idx],
         y_test=y[test_idx],
         baseline_prev_test=baseline_prev[test_idx],
     )
 
     classifier_frame = pd.DataFrame(
         {
-            "timestamp": seq_times,
-            "alqs_norm": alqs_scaler.transform(pd.DataFrame({"alqs": y})).reshape(-1),
-            "weather_state": weather_state_for_y,
-            "sin_time": sin_time_for_y,
-            "cos_time": cos_time_for_y,
+            "timestamp": [seq_target_timestamps[i] for i in test_idx],
+            "webcam_id": [seq_webcam_ids[i] for i in test_idx],
+            "alqs": y[test_idx],
+            "baseline_prev": baseline_prev[test_idx],
         }
     )
-
-    domain_genres = []
-    for _, row in classifier_frame.iterrows():
-        if row["alqs_norm"] > 0.75 and row["weather_state"] in {"clear", "partly_cloudy"}:
-            domain_genres.append("golden_hour")
-        elif row["weather_state"] in {"fog", "rain", "storm"}:
-            domain_genres.append("moody")
-        elif row["alqs_norm"] < 0.25:
-            domain_genres.append("night_astro")
-        elif row["weather_state"] in {"cloudy", "snow"}:
-            domain_genres.append("landscape")
-        else:
-            domain_genres.append("street")
-    classifier_frame["genre"] = domain_genres
-
     classifier_frame.to_parquet(output_dir / "classifier_features.parquet", index=False)
 
-    latest_window = x[-1] if len(x) else np.zeros((window_size, len(CONTINUOUS_FEATURES)), dtype=np.float32)
-    np.save(output_dir / "latest_window.npy", latest_window)
-
     joblib.dump(
-        FeatureArtifacts(
-            scaler=scaler,
-            weather_encoder=weather_encoder,
-            alqs_scaler=alqs_scaler,
-        ),
+        FeatureArtifacts(feature_scaler=feature_scaler),
         output_dir / "feature_artifacts.joblib",
     )
 
     metadata = {
         "window_size": window_size,
-        "continuous_features": CONTINUOUS_FEATURES,
-        "weather_categories": weather_encoder.categories_[0].tolist(),
+        "feature_columns": FEATURE_COLUMNS,
+        "split_by": "webcam_id",
         "split_counts": {
             "train": int(len(train_idx)),
             "val": int(len(val_idx)),
             "test": int(len(test_idx)),
         },
+        "webcam_counts": {
+            "all": int(len(set(seq_webcam_ids))),
+            "train": int(len(train_webcams)),
+            "val": int(len(val_webcams)),
+            "test": int(len(test_webcams)),
+        },
     }
     (output_dir / "feature_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
+    LOGGER.info("Feature engineering complete. Output written to %s", output_dir)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Build LuxAeterna sequence and classifier features")
-    parser.add_argument("--weather-path", default="data/raw/weather")
-    parser.add_argument("--label-path", default="data/processed/alqs_labels.parquet")
+    parser = argparse.ArgumentParser(description="Build LuxAeterna sequence features from global webcam data")
+    parser.add_argument("--weather-path", default="data/processed/global_dataset")
     parser.add_argument("--output-dir", default="data/processed")
-    parser.add_argument("--window-size", type=int, default=24)
+    parser.add_argument("--window-size", type=int, default=12)
     return parser
 
 
@@ -312,11 +315,9 @@ def main() -> None:
 
     build_sequence_dataset(
         weather_path=Path(args.weather_path),
-        label_path=Path(args.label_path),
         output_dir=Path(args.output_dir),
-        window_size=args.window_size,
+        window_size=max(2, args.window_size),
     )
-    LOGGER.info("Feature engineering complete. Outputs written to %s", args.output_dir)
 
 
 if __name__ == "__main__":
