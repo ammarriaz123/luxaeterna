@@ -18,8 +18,8 @@ LOGGER = logging.getLogger("luxaeterna.models.lstm_predictor")
 class LstmTrainingConfig:
     data_path: Path
     artifact_dir: Path
-    epochs: int = 120
-    batch_size: int = 64
+    epochs: int = 200
+    batch_size: int = 32
     learning_rate: float = 0.001
 
 
@@ -39,21 +39,53 @@ def make_tf_dataset(x: np.ndarray, y: np.ndarray, batch_size: int, training: boo
 
 
 def build_model(input_shape: tuple[int, int], learning_rate: float) -> keras.Model:
-    model = keras.Sequential(
-        [
-            keras.layers.Input(shape=input_shape),
-            keras.layers.LSTM(128, dropout=0.2, return_sequences=True),
-            keras.layers.LSTM(64, dropout=0.2, return_sequences=False),
-            keras.layers.Dense(32, activation="relu"),
-            keras.layers.Dense(1, activation="linear"),
-        ],
-        name="luxaeterna_lstm_predictor",
-    )
+    inputs = keras.layers.Input(shape=input_shape)
+
+    x = keras.layers.LayerNormalization(name="input_norm")(inputs)
+    x = keras.layers.Conv1D(
+        filters=64,
+        kernel_size=3,
+        padding="causal",
+        activation="swish",
+        name="temporal_conv",
+    )(x)
+    x = keras.layers.SpatialDropout1D(0.15, name="temporal_spatial_dropout")(x)
+
+    x = keras.layers.Bidirectional(
+        keras.layers.LSTM(128, return_sequences=True, dropout=0.2, recurrent_dropout=0.1),
+        name="bilstm_1",
+    )(x)
+    x = keras.layers.LayerNormalization(name="bilstm_1_norm")(x)
+
+    x = keras.layers.Bidirectional(
+        keras.layers.LSTM(64, return_sequences=False, dropout=0.2, recurrent_dropout=0.1),
+        name="bilstm_2",
+    )(x)
+
+    x = keras.layers.Dense(
+        128,
+        activation="swish",
+        kernel_regularizer=keras.regularizers.l2(1e-5),
+        name="dense_128",
+    )(x)
+    x = keras.layers.Dropout(0.3, name="dense_dropout")(x)
+    x = keras.layers.Dense(
+        64,
+        activation="swish",
+        kernel_regularizer=keras.regularizers.l2(1e-5),
+        name="dense_64",
+    )(x)
+    outputs = keras.layers.Dense(1, activation="linear", name="alqs_output")(x)
+
+    model = keras.Model(inputs=inputs, outputs=outputs, name="luxaeterna_lstm_predictor_v2")
 
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
-        loss="mse",
-        metrics=[keras.metrics.MeanAbsoluteError(name="mae")],
+        optimizer=keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0),
+        loss=keras.losses.Huber(delta=2.0),
+        metrics=[
+            keras.metrics.MeanAbsoluteError(name="mae"),
+            keras.metrics.RootMeanSquaredError(name="rmse"),
+        ],
     )
     return model
 
@@ -91,13 +123,14 @@ def train(config: LstmTrainingConfig) -> dict[str, float]:
         keras.callbacks.ReduceLROnPlateau(
             monitor="val_loss",
             factor=0.5,
-            patience=5,
+            patience=7,
             min_lr=1e-6,
             verbose=1,
         ),
         keras.callbacks.EarlyStopping(
             monitor="val_loss",
-            patience=10,
+            min_delta=1e-3,
+            patience=18,
             restore_best_weights=True,
             verbose=1,
         ),
@@ -179,8 +212,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train LuxAeterna LSTM predictor")
     parser.add_argument("--data-path", default="data/processed/sequence_dataset.npz")
     parser.add_argument("--artifact-dir", default="models/artifacts")
-    parser.add_argument("--epochs", type=int, default=120)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=0.001)
     return parser
 

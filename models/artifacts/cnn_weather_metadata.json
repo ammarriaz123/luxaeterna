@@ -1,0 +1,72 @@
+{
+  "model_name": "luxaeterna_cnn_weather",
+  "version": "20260502_181105",
+  "input_shape": {
+    "image": [
+      224,
+      224,
+      3
+    ],
+    "weather": [
+      8
+    ]
+  },
+  "weather_features": [
+    "temperature",
+    "relative_humidity",
+    "visibility",
+    "cloud_cover_low",
+    "cloud_cover_mid",
+    "cloud_cover_high",
+    "weather_code",
+    "total_cloud_cover"
+  ],
+  "metrics": {
+    "test_loss": 32.39789581298828,
+    "test_mae": 4.13411283493042,
+    "test_rmse": 5.691915035247803,
+    "test_mse": 32.39789581298828
+  },
+  "history": {
+    "epochs_trained": 20,
+    "best_val_loss": 32.68961715698242
+  },
+  "data": {
+    "split_counts": {
+      "train": 24490,
+      "val": 5247,
+      "test": 5246
+    },
+    "skipped_missing_image": 250,
+    "skipped_invalid_image": 0
+  },
+  "training": {
+    "freeze_backbone": true,
+    "batch_size": 32,
+    "epochs": 100,
+    "learning_rate": 0.0001
+  },
+  "weather_scaler": {
+    "mean": [
+      9.754450798034668,
+      71.93379974365234,
+      23821.8359375,
+      44.23528289794922,
+      16.663450241088867,
+      16.680112838745117,
+      1.6048321723937988,
+      77.57884979248047
+    ],
+    "std": [
+      2.660757064819336,
+      9.091843605041504,
+      6758.00927734375,
+      43.933860778808594,
+      35.78578186035156,
+      34.424190521240234,
+      2.942519426345825,
+      89.17573547363281
+    ]
+  },
+  "created_at_utc": "2026-05-02T20:49:53.365175+00:00"
+}

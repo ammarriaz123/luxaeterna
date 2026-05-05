@@ -13,7 +13,7 @@ import pandas as pd
 import tensorflow as tf
 from sklearn.metrics import f1_score, precision_score, recall_score
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder, MinMaxScaler, OneHotEncoder
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
 from sklearn.utils.class_weight import compute_class_weight
 from tensorflow import keras
 
@@ -21,14 +21,15 @@ LOGGER = logging.getLogger("luxaeterna.models.mlp_recommender")
 
 GENRE_CLASSES = ["landscape", "golden_hour", "night_astro", "street", "moody"]
 WEATHER_STATES = ["clear", "partly_cloudy", "cloudy", "rain", "fog", "snow", "storm", "unknown"]
+GENRE_TO_INDEX = {genre: idx for idx, genre in enumerate(GENRE_CLASSES)}
 
 
 @dataclass(slots=True)
 class MlpTrainingConfig:
     features_path: Path
     artifact_dir: Path
-    epochs: int = 80
-    batch_size: int = 64
+    epochs: int = 120
+    batch_size: int = 32
     learning_rate: float = 0.001
 
 
@@ -67,36 +68,74 @@ def generate_synthetic_bootstrap_data(n_samples: int = 3000, seed: int = 42) -> 
     )
 
 
-def _load_or_bootstrap(path: Path) -> pd.DataFrame:
+def _load_or_bootstrap(path: Path) -> tuple[pd.DataFrame, bool]:
     if path.exists():
         frame = pd.read_parquet(path)
         required_cols = {"alqs_norm", "weather_state", "sin_time", "cos_time", "genre"}
         if required_cols.issubset(frame.columns):
-            return frame.dropna(subset=list(required_cols))
+            return frame.dropna(subset=list(required_cols)), False
         LOGGER.warning("Feature file missing columns; synthetic bootstrap data will be used")
-    return generate_synthetic_bootstrap_data()
+    return generate_synthetic_bootstrap_data(), True
 
 
 def build_model(input_dim: int, learning_rate: float) -> keras.Model:
     inputs = keras.layers.Input(shape=(input_dim,))
-    x = keras.layers.Dense(64, activation="relu")(inputs)
-    x = keras.layers.BatchNormalization()(x)
-    x = keras.layers.Dropout(0.3)(x)
-    x = keras.layers.Dense(32, activation="relu")(x)
-    x = keras.layers.BatchNormalization()(x)
+    x = keras.layers.LayerNormalization(name="input_norm")(inputs)
+    x = keras.layers.Dense(128, activation="swish", name="dense_128")(x)
+    x = keras.layers.BatchNormalization(name="bn_128")(x)
+    x = keras.layers.Dropout(0.35, name="dropout_128")(x)
+    x = keras.layers.Dense(64, activation="swish", name="dense_64")(x)
+    x = keras.layers.BatchNormalization(name="bn_64")(x)
+    x = keras.layers.Dropout(0.25, name="dropout_64")(x)
+    x = keras.layers.Dense(32, activation="swish", name="dense_32")(x)
     outputs = keras.layers.Dense(5, activation="softmax")(x)
 
     model = keras.Model(inputs=inputs, outputs=outputs, name="luxaeterna_mlp_recommender")
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
-        loss="categorical_crossentropy",
-        metrics=[keras.metrics.CategoricalAccuracy(name="accuracy")],
+        optimizer=keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0),
+        loss=keras.losses.CategoricalCrossentropy(label_smoothing=0.05),
+        metrics=[
+            keras.metrics.CategoricalAccuracy(name="accuracy"),
+            keras.metrics.TopKCategoricalAccuracy(k=2, name="top2_accuracy"),
+        ],
     )
     return model
 
 
+def _safe_train_test_split(
+    x: np.ndarray,
+    y: np.ndarray,
+    y_labels: np.ndarray,
+    test_size: float,
+    random_state: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Use stratified split when possible, otherwise fall back to unstratified split."""
+    class_counts = np.bincount(y_labels, minlength=len(GENRE_CLASSES))
+    min_non_zero_count = int(class_counts[class_counts > 0].min()) if np.any(class_counts > 0) else 0
+    stratify_labels = y_labels if min_non_zero_count >= 2 else None
+
+    if stratify_labels is None:
+        LOGGER.warning("Not enough samples per class for stratified split; using random split")
+
+    return train_test_split(
+        x,
+        y,
+        y_labels,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=stratify_labels,
+    )
+
+
 def train(config: MlpTrainingConfig) -> dict[str, float]:
-    frame = _load_or_bootstrap(config.features_path)
+    keras.utils.set_random_seed(42)
+    frame, used_bootstrap = _load_or_bootstrap(config.features_path)
+
+    frame = frame.copy()
+    frame["genre"] = frame["genre"].astype(str)
+    frame = frame[frame["genre"].isin(GENRE_CLASSES)]
+    if frame.empty:
+        raise ValueError("No rows with supported genre labels were found")
 
     alqs_scaler = MinMaxScaler()
     alqs_scaled = alqs_scaler.fit_transform(frame[["alqs_norm"]])
@@ -113,25 +152,22 @@ def train(config: MlpTrainingConfig) -> dict[str, float]:
         axis=1,
     ).astype(np.float32)
 
-    y_encoder = LabelEncoder()
-    y_labels = y_encoder.fit_transform(frame["genre"])
+    y_labels = frame["genre"].map(GENRE_TO_INDEX).to_numpy(dtype=np.int64)
     y = tf.keras.utils.to_categorical(y_labels, num_classes=5)
 
-    x_train, x_temp, y_train, y_temp, y_labels_train, y_labels_temp = train_test_split(
+    x_train, x_temp, y_train, y_temp, y_labels_train, y_labels_temp = _safe_train_test_split(
         x,
         y,
         y_labels,
         test_size=0.30,
         random_state=42,
-        stratify=y_labels,
     )
-    x_val, x_test, y_val, y_test, y_labels_val, y_labels_test = train_test_split(
+    x_val, x_test, y_val, y_test, y_labels_val, y_labels_test = _safe_train_test_split(
         x_temp,
         y_temp,
         y_labels_temp,
         test_size=0.50,
         random_state=42,
-        stratify=y_labels_temp,
     )
 
     model = build_model(input_dim=x.shape[1], learning_rate=config.learning_rate)
@@ -144,8 +180,8 @@ def train(config: MlpTrainingConfig) -> dict[str, float]:
     class_weights = {int(k): float(v) for k, v in zip(np.unique(y_labels_train), class_weights_values)}
 
     callbacks = [
-        keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=4, min_lr=1e-6, verbose=1),
-        keras.callbacks.EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True, verbose=1),
+        keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=5, min_lr=1e-6, verbose=1),
+        keras.callbacks.EarlyStopping(monitor="val_loss", min_delta=1e-3, patience=14, restore_best_weights=True, verbose=1),
     ]
 
     model.fit(
@@ -181,7 +217,8 @@ def train(config: MlpTrainingConfig) -> dict[str, float]:
     joblib.dump(
         {
             "weather_encoder": weather_encoder,
-            "label_encoder": y_encoder,
+            "genre_to_index": GENRE_TO_INDEX,
+            "index_to_genre": {idx: genre for idx, genre in enumerate(GENRE_CLASSES)},
             "alqs_scaler": alqs_scaler,
             "genre_classes": GENRE_CLASSES,
         },
@@ -191,8 +228,9 @@ def train(config: MlpTrainingConfig) -> dict[str, float]:
     metadata = {
         "version": version,
         "input_dim": int(x.shape[1]),
+        "used_bootstrap_data": bool(used_bootstrap),
         "weather_categories": weather_encoder.categories_[0].tolist(),
-        "label_classes": y_encoder.classes_.tolist(),
+        "label_classes": GENRE_CLASSES,
         "metrics": {
             "precision_weighted": float(precision),
             "recall_weighted": float(recall),
@@ -214,8 +252,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train LuxAeterna MLP recommender")
     parser.add_argument("--features-path", default="data/processed/classifier_features.parquet")
     parser.add_argument("--artifact-dir", default="models/artifacts")
-    parser.add_argument("--epochs", type=int, default=80)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=120)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=0.001)
     return parser
 
