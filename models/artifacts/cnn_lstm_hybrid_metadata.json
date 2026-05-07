@@ -1,0 +1,21 @@
+{
+  "model_name": "luxaeterna_cnn_lstm_hybrid",
+  "version": "20260505_142246",
+  "sequence_length": 12,
+  "forecast_horizon": 3,
+  "image_size": 160,
+  "feature_dim": 256,
+  "lstm_units": 128,
+  "backbone": "lite",
+  "metrics": {
+    "test_mae": NaN,
+    "test_rmse": NaN,
+    "baseline_mae": 4.589295514380269,
+    "improvement_pct": NaN
+  },
+  "data_counts": {
+    "train": 45577,
+    "val": 9767,
+    "test": 9767
+  }
+}

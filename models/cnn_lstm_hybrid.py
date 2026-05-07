@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import glob
+from functools import lru_cache
 from typing import List, Optional
 
 import numpy as np
@@ -25,6 +26,16 @@ def load_dataframe(data_path: str) -> pd.DataFrame:
     df = pd.concat(dfs, ignore_index=True)
     df = df.sort_values(["webcam_id", "timestamp"])  # assume these columns exist
     return df
+
+
+@lru_cache(maxsize=8192)
+def _load_image(path: str, image_width: int, image_height: int) -> np.ndarray:
+    im = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if im is None:
+        raise ValueError("invalid image")
+    im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+    im = cv2.resize(im, (image_width, image_height))
+    return im.astype(np.float32) / 255.0
 
 
 def build_sequence_records(
@@ -59,7 +70,8 @@ def build_sequence_records(
 
 
 class HybridSequence(keras.utils.Sequence):
-    def __init__(self, records, batch_size, seq_len, image_size=(224, 224), metadata_len: Optional[int] = None):
+    def __init__(self, records, batch_size, seq_len, image_size=(224, 224), metadata_len: Optional[int] = None, **kwargs):
+        super().__init__(**kwargs)
         self.records = records
         self.batch_size = batch_size
         self.seq_len = seq_len
@@ -80,12 +92,7 @@ class HybridSequence(keras.utils.Sequence):
         for i, (img_paths, meta, target, _last_observed) in enumerate(batch):
             for t, p in enumerate(img_paths):
                 try:
-                    im = cv2.imdecode(np.fromfile(p, dtype=np.uint8), cv2.IMREAD_COLOR)
-                    if im is None:
-                        raise ValueError("invalid image")
-                    im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
-                    im = cv2.resize(im, (self.image_size[1], self.image_size[0]))
-                    imgs[i, t] = im.astype(np.float32) / 255.0
+                    imgs[i, t] = _load_image(p, self.image_size[1], self.image_size[0])
                 except Exception:
                     imgs[i, t] = 0.0
             if metas is not None and meta is not None:
@@ -100,19 +107,35 @@ class HybridSequence(keras.utils.Sequence):
         return inputs, y
 
 
+def build_cnn_feature_model(image_size, feature_dim: int, freeze_backbone: bool, backbone: str):
+    if backbone == "mobilenetv2":
+        base_cnn = keras.applications.MobileNetV2(
+            include_top=False,
+            weights="imagenet",
+            input_shape=(image_size[0], image_size[1], image_size[2]),
+        )
+        base_cnn.trainable = not freeze_backbone
+        x = layers.GlobalAveragePooling2D(name="gap")(base_cnn.output)
+        x = layers.Dense(feature_dim, activation="relu", name="feature_dense")(x)
+        return keras.Model(base_cnn.input, x, name="cnn_feature_model")
+
+    inputs = keras.Input(shape=(image_size[0], image_size[1], image_size[2]))
+    x = layers.Conv2D(16, 3, strides=2, padding="same", activation="relu")(inputs)
+    x = layers.SeparableConv2D(32, 3, strides=2, padding="same", activation="relu")(x)
+    x = layers.SeparableConv2D(64, 3, strides=2, padding="same", activation="relu")(x)
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(feature_dim, activation="relu")(x)
+    return keras.Model(inputs, x, name="lite_cnn_feature_model")
+
+
 def build_hybrid_model(seq_len: int, image_size=(224, 224, 3), metadata_len: Optional[int] = None,
                        feature_dim: int = 256, lstm_units: int = 128, freeze_backbone: bool = True,
-                       learning_rate: float = 1e-4):
+                       learning_rate: float = 1e-4, backbone: str = "lite"):
     # Image input: sequence of images
     img_in = keras.Input(shape=(seq_len, image_size[0], image_size[1], image_size[2]), name="images")
 
-    # Build a small CNN backbone (MobileNetV2-based but returning a feature vector)
-    base_cnn = keras.applications.MobileNetV2(include_top=False, weights="imagenet",
-                                              input_shape=(image_size[0], image_size[1], image_size[2]))
-    base_cnn.trainable = not freeze_backbone
-    x = layers.GlobalAveragePooling2D(name="gap")(base_cnn.output)
-    x = layers.Dense(feature_dim, activation="relu", name="feature_dense")(x)
-    cnn_feature_model = keras.Model(base_cnn.input, x, name="cnn_feature_model")
+    # Use a lightweight CNN by default so the sequence model can finish more epochs on CPU.
+    cnn_feature_model = build_cnn_feature_model(image_size, feature_dim, freeze_backbone, backbone)
 
     # Wrap with TimeDistributed
     td = layers.TimeDistributed(cnn_feature_model, name="td_cnn")(img_in)
@@ -191,11 +214,22 @@ def train(args):
                               learning_rate=args.learning_rate)
 
     callbacks = [
-        keras.callbacks.EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True),
+        keras.callbacks.EarlyStopping(
+            monitor="val_loss",
+            patience=10,
+            start_from_epoch=args.min_epochs,
+            restore_best_weights=True,
+        ),
         keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=5)
     ]
 
-    model.fit(train_seq, validation_data=val_seq, epochs=args.epochs, callbacks=callbacks, verbose=1)
+    model.fit(
+        train_seq,
+        validation_data=val_seq,
+        epochs=args.epochs,
+        callbacks=callbacks,
+        verbose=1,
+    )
 
     # evaluate
     metrics = model.evaluate(test_seq, verbose=1)
@@ -230,6 +264,7 @@ def train(args):
         "image_size": args.img_size,
         "feature_dim": args.feature_dim,
         "lstm_units": args.lstm_units,
+        "backbone": args.backbone,
         "metrics": result,
         "data_counts": {"train": len(train_recs), "val": len(val_recs), "test": len(test_recs)},
     }
@@ -244,15 +279,19 @@ def parse_args():
     p.add_argument("--data-path", required=True)
     p.add_argument("--artifact-dir", default="models/artifacts")
     p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--min-epochs", type=int, default=20)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--learning-rate", type=float, default=1e-4)
     p.add_argument("--sequence-length", type=int, default=12)
     p.add_argument("--forecast-horizon", type=int, default=1)
-    p.add_argument("--img-size", type=int, default=224)
+    p.add_argument("--img-size", type=int, default=160)
     p.add_argument("--feature-dim", type=int, default=256)
     p.add_argument("--lstm-units", type=int, default=128)
     p.add_argument("--freeze-backbone", action="store_true")
     p.add_argument("--use-metadata", action="store_true")
+    p.add_argument("--backbone", choices=["lite", "mobilenetv2"], default="lite")
+    p.add_argument("--workers", type=int, default=max(2, min(8, os.cpu_count() or 2)))
+    p.add_argument("--max-queue-size", type=int, default=32)
     p.add_argument("--run-tag", default=None)
     args = p.parse_args()
     if args.run_tag is None:
@@ -262,6 +301,10 @@ def parse_args():
 
     if args.forecast_horizon < 1:
         raise ValueError("--forecast-horizon must be >= 1")
+    if args.min_epochs < 0:
+        raise ValueError("--min-epochs must be >= 0")
+    if args.epochs < args.min_epochs:
+        raise ValueError("--epochs must be >= --min-epochs")
     return args
 
 

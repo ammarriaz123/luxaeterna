@@ -1,0 +1,30 @@
+{
+  "model_type": "random_forest",
+  "target": "target_multiclass_in_3",
+  "features": [
+    "latitude",
+    "longitude",
+    "temperature",
+    "relative_humidity",
+    "visibility",
+    "cloud_cover_low",
+    "cloud_cover_mid",
+    "cloud_cover_high",
+    "weather_code",
+    "solar_elevation",
+    "temp_lag_1",
+    "rh_lag_1",
+    "cloud_low_lag_1",
+    "temp_lag_2",
+    "rh_lag_2",
+    "cloud_low_lag_2",
+    "temp_lag_3",
+    "rh_lag_3",
+    "cloud_low_lag_3",
+    "temp_change_1h",
+    "cloud_low_change_1h"
+  ],
+  "metrics": {
+    "accuracy": 0.672433837105929
+  }
+}

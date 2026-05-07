@@ -1,0 +1,20 @@
+{
+  "model_type": "lstm_classifier",
+  "target": "target_multiclass_in_3",
+  "features": [
+    "latitude",
+    "longitude",
+    "temperature",
+    "relative_humidity",
+    "visibility",
+    "cloud_cover_low",
+    "cloud_cover_mid",
+    "cloud_cover_high",
+    "weather_code",
+    "solar_elevation"
+  ],
+  "window_size": 6,
+  "metrics": {
+    "accuracy": 0.4952850225129556
+  }
+}
