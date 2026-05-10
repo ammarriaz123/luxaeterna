@@ -39,11 +39,12 @@ The system is designed for practical MLOps workflows:
 |   |-- artifacts/           # generated model outputs
 |   `-- __init__.py
 |-- logs/                    # runtime logs and feedback logs
+|-- web/                     # Vite + React dashboard (npm commands run *inside* web/)
 |-- run_pipeline.ps1         # Windows-native pipeline runner
 |-- run_pipeline.sh          # Bash pipeline runner
 |-- Dockerfile
 |-- requirements.txt
-|-- .env.example
+|-- .env
 `-- README.md
 ```
 
@@ -68,12 +69,16 @@ The system is designed for practical MLOps workflows:
 
 - FastAPI app with strict Pydantic validation
 - Startup lifespan model load (single initialization)
-- Forecast and recommendation endpoints
+- **Lighting-event ensemble** (`POST /predict/event`): XGBoost + multiclass LSTM + MLP (see `FRONTEND_INTEGRATION_GUIDE.md`)
+- Legacy ALQS LSTM (`POST /predict`, `GET /forecast`) and genre MLP (`POST /recommend`) when those artifacts exist
 - Background weather ingestion task and async feedback logging
+- **`GET /`** redirects to **`/docs`**
+- **`POST /predict/event/from_location`**: Open-Meteo hourly features → same ensemble as `/predict/event`, plus rules-based (optional OpenAI) **shooting coach**
+- **`POST /coach/shooting`**: coach only from client-supplied class probabilities + weather snapshot (no weather fetch)
 
 ## Requirements
 
-- Python 3.12
+- Python **3.10, 3.11, or 3.12** (recommended). On Windows, **avoid 3.13+ for `pip install -r requirements.txt`** unless you upgrade NumPy/TensorFlow to versions that publish wheels for your Python, or install Visual Studio C++ Build Tools (otherwise pip may try to compile NumPy from source and fail).
 - Windows PowerShell (recommended on Windows) or Bash
 - Internet access for weather/webcam data pulls
 
@@ -83,8 +88,7 @@ Optional:
 
 ## Configuration
 
-1. Copy .env.example to .env
-2. Set environment variables as needed
+1. Create or edit `.env` in the repo root (see variables below)
 
 Important variables:
 
@@ -95,11 +99,14 @@ Important variables:
 - OPENWEATHERMAP_API_KEY: optional, enables OWM enrichment (legacy local pipeline)
 - PHOTO_LAT and PHOTO_LON: location for legacy local pipeline and API defaults
 - INGEST_INTERVAL_SECONDS: API background ingestion interval
+- MODEL_ARTIFACT_DIR: folder with `models/artifacts` (ensemble + optional legacy)
+- CORS_ORIGINS: comma-separated origins for the web app (e.g. Vite on :5173)
+- INGEST_STORAGE: `parquet` or `sqlite` for background weather pulls
+- **Shooting coach (optional LLM):** `COACH_LLM` set to `1`, `true`, `yes`, or `on` plus `OPENAI_API_KEY` to enrich rules with OpenAI; `COACH_OPENAI_MODEL` (default `gpt-4o-mini`) selects the chat model
 
 Security note:
 
-- Never commit real secrets in .env or .env.example
-- Keep .env local only
+- Never commit `.env` (it is gitignored); keep secrets local only
 
 ## Quickstart (Windows)
 
@@ -125,7 +132,7 @@ Useful options:
 
 What the pipeline does:
 
-1. Creates/uses .venv
+1. Creates/uses `venv` (or `.venv` if you prefer)
 2. Installs dependencies
 3. Discovers global webcams and caches metadata
 4. Samples webcams and builds a global dataset with image + weather pairing
@@ -149,12 +156,26 @@ LEGACY_LOCAL_PIPELINE=1 ./run_pipeline.sh
 After training artifacts exist under models/artifacts:
 
 ```powershell
-.\.venv\Scripts\python.exe -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+.\venv\Scripts\python.exe -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 Open API docs:
 
 - http://127.0.0.1:8000/docs
+
+## Web dashboard (local)
+
+The UI lives under **`web/`** — run npm from that folder, not the repo root:
+
+```powershell
+cd web
+npm install
+npm run dev
+```
+
+Open **http://localhost:5173**. The dev server proxies **`/api/*`** to the API on port **8000**, so keep uvicorn running.
+
+Production build: `cd web && npm run build` — set **`VITE_API_URL`** to your deployed API origin (no trailing slash) before building.
 
 ## API Endpoints
 
@@ -173,6 +194,8 @@ Output:
 
 ### POST /recommend
 
+Requires **`mlp_recommender.keras`** and **`mlp_aux.joblib`**. Returns **503** if not trained.
+
 Input:
 
 - alqs (0-100)
@@ -183,6 +206,20 @@ Output:
 
 - ranked_genres (sorted with probability scores)
 - model_version
+
+### POST /predict/event
+
+**4-class lighting ensemble** (power-weighted XGB + LSTM + MLP). Requires multiclass artifacts under `models/artifacts/`. Request body matches `FRONTEND_INTEGRATION_GUIDE.md`: **`sequence`** `6×10` features + **`tabular`** length **21** (lags at final timestep).
+
+Output: class probabilities, predicted label, ensemble weights.
+
+### POST /predict/event/from_location
+
+**Same ensemble as `/predict/event`**, but the server fetches Open-Meteo for **`latitude`**, **`longitude`**, and **`past_hours`** (24–240), builds `sequence` + `tabular`, runs inference, and returns **`weather_snapshot`**, **`prediction`**, and **`coach`** (rules; optional OpenAI when `COACH_LLM` + `OPENAI_API_KEY` are set).
+
+### POST /coach/shooting
+
+**Shooting / camera recommendations** from an existing **`predicted_class_id`**, **`predicted_label`**, **`class_probabilities`**, and optional **`weather_snapshot`** — no model re-run. Same rules + optional LLM enrichment as the location endpoint.
 
 ### GET /forecast
 
@@ -206,8 +243,9 @@ Output:
 Output:
 
 - API status
-- model versions
-- data freshness in minutes
+- legacy LSTM / MLP metadata versions (genre recommender shows **unknown** if `mlp_metadata.json` or recommender artifacts are missing)
+- **`capabilities`**: which routes are actually loaded
+- **`ensemble_event`**: XGB + multiclass LSTM/MLP metadata and blend weights when ensemble is loaded
 
 ### GET /health
 
@@ -219,13 +257,18 @@ Output:
 
 Typical outputs in models/artifacts:
 
-- lstm_predictor.keras
-- lstm_predictor_savedmodel/
-- lstm_metadata.json
-- mlp_recommender.keras
-- mlp_recommender_savedmodel/
-- mlp_metadata.json
-- mlp_aux.joblib
+**Lighting-event ensemble (used by `POST /predict/event`):**
+
+- `xgb_multiclass_model.json`, `xgb_multiclass_metadata.json`
+- `lstm_multiclass_model.keras`, `lstm_multiclass_scaler.joblib`, `lstm_multiclass_metadata.json`
+- `mlp_multiclass_model.keras`, `mlp_multiclass_scaler.joblib`, `mlp_multiclass_metadata.json`
+
+**Legacy ALQS + genres (optional):**
+
+- lstm_predictor.keras, lstm_metadata.json
+- mlp_recommender.keras, mlp_metadata.json, mlp_aux.joblib
+
+Keras multiclass models may have been saved with a **newer Keras** than `tensorflow-cpu` bundles; `api/ensemble_bundle.py` applies small load-time compat shims so they still load on TF 2.16 / Keras 3.12.
 
 ## Data Artifacts
 
@@ -253,12 +296,33 @@ If OPENWEATHERMAP_API_KEY is missing, OWM enrichment is skipped. Base weather in
 Run feature engineering successfully first:
 
 ```powershell
-.\.venv\Scripts\python.exe -m data.feature_engineer --weather-path data/raw/weather --label-path data/processed/alqs_labels.parquet --output-dir data/processed
+.\venv\Scripts\python.exe -m data.feature_engineer --weather-path data/raw/weather --label-path data/processed/alqs_labels.parquet --output-dir data/processed
 ```
 
 ### API startup error about missing model artifacts
 
-Train models first with run_pipeline.ps1 (TrainingLoops >= 1), then restart API.
+You need **either** the **ensemble** files above **or** **`lstm_predictor.keras`** (or both). Train or copy artifacts into `models/artifacts`, then restart the API.
+
+### npm ENOENT package.json
+
+Run **`npm install`** / **`npm run dev`** from **`web/`**, not the repository root.
+
+## Documentation map (avoid mixing two pipelines)
+
+| Doc | What it describes |
+|-----|-------------------|
+| **`FRONTEND_INTEGRATION_GUIDE.md`** | **Production inference contract**: 6×10 sequence + 21 tabular features, ensemble weights — matches **`POST /predict/event`**. |
+| **`DATA_PIPELINE.md`** | Deep dive on **legacy local** ingestion (collector + labeller + feature engineer): often **24×7** windows and **15‑minute** resampling for **`lstm_predictor`** / **`mlp_recommender`**. Not the same tensor shape as the global multiclass ensemble. |
+| **`PROJECT_HANDOVER.md`** | Product narrative and ensemble rationale; filenames align with `models/artifacts/*multiclass*`. |
+| **`PIPELINE_REPORT.md`**, **`IMPROVEMENTS_GUIDE.md`**, **`QUICK_START.md`**, **`IMPLEMENTATION_SUMMARY.md`**, **`VALIDATION_CHECKLIST.md`** | Historical / extended-pipeline notes (dates ~May 2026); useful context, may reference machine-specific paths. |
+
+## Next steps (product)
+
+1. **Real inputs for `/predict/event`**: Server or script that pulls Open-Meteo + PyEphem + lag features for a lat/lon (per `FRONTEND_INTEGRATION_GUIDE.md`), then wire the **web** UI to that instead of demo vectors.
+2. **Optional `/recommend`**: Run `models/mlp_recommender.py` to produce `mlp_recommender.keras` + `mlp_aux.joblib` if you want genre rankings in-app.
+3. **Agent + notifications**: Scheduled job (thresholds, quiet hours) + web push or email; reuse `/status` and `/predict/event`.
+4. **Deploy**: API (Docker/Railway) + static `web` build with `VITE_API_URL`; set `CORS_ORIGINS`.
+5. **Tests**: Contract tests for `/predict/event` JSON and scaler parity.
 
 ## Docker
 

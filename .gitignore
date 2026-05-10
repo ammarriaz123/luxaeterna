@@ -20,6 +20,10 @@ dist/
 .ruff_cache/
 .ipynb_checkpoints/
 
+# Secrets / local env (never commit)
+.env
+.env.local
+
 # IDE/editor
 .vscode/
 .idea/

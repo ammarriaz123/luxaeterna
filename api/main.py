@@ -6,23 +6,55 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+UTC = timezone.utc
 from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import aiofiles
+import httpx
 import joblib
 import numpy as np
 from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from tensorflow import keras
 
+from api.coach import build_rules_coach, maybe_enrich_coach_with_openai
+from api.ensemble_bundle import (
+    CLASS_LABELS,
+    WEIGHT_LSTM,
+    WEIGHT_MLP,
+    WEIGHT_XGB,
+    EnsembleBundle,
+    ensemble_loadable,
+    load_ensemble_bundle,
+    predict_lighting_event_probs,
+)
+from api.lighting_features import (
+    build_ensemble_arrays,
+    fetch_forecast_hourly_dataframe,
+    nan_safe_arrays,
+)
 from api.schemas import (
+    CoachFromPredictionRequest,
+    CoachFromPredictionResponse,
     FeedbackRequest,
     FeedbackResponse,
     FeatureWindowRequest,
     ForecastPoint,
     ForecastResponse,
     HealthResponse,
+    LightingClassScore,
+    PredictFromLocationRequest,
+    PredictFromLocationResponse,
+    PredictLightingEventRequest,
+    PredictLightingEventResponse,
     PredictResponse,
     RecommendRequest,
     RecommendResponse,
@@ -35,11 +67,12 @@ LOGGER = logging.getLogger("luxaeterna.api")
 
 @dataclass(slots=True)
 class ModelRegistry:
-    lstm_model: keras.Model
-    mlp_model: keras.Model
+    lstm_model: keras.Model | None
+    mlp_model: keras.Model | None
     lstm_metadata: dict[str, Any]
     mlp_metadata: dict[str, Any]
-    mlp_aux: dict[str, Any]
+    mlp_aux: dict[str, Any] | None
+    ensemble: EnsembleBundle | None
     ingest_task: asyncio.Task[None] | None = None
 
 
@@ -60,6 +93,11 @@ def _compute_data_freshness_minutes() -> float | None:
 
     newest_mtime = datetime.fromtimestamp(parquet_files[0].stat().st_mtime, tz=UTC)
     return (datetime.now(UTC) - newest_mtime).total_seconds() / 60.0
+
+
+def _cors_origins() -> list[str]:
+    raw = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
+    return [o.strip() for o in raw.split(",") if o.strip()]
 
 
 async def _periodic_ingestion_loop() -> None:
@@ -83,34 +121,58 @@ async def _periodic_ingestion_loop() -> None:
         await asyncio.sleep(interval)
 
 
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    global registry
+def _load_models(artifact_dir: Path) -> ModelRegistry:
+    ensemble: EnsembleBundle | None = None
+    if ensemble_loadable(artifact_dir):
+        LOGGER.info("Loading multiclass lighting ensemble")
+        ensemble = load_ensemble_bundle(artifact_dir)
+    else:
+        LOGGER.warning("Ensemble artifacts incomplete; /predict/event unavailable")
 
-    artifact_dir = Path(os.getenv("MODEL_ARTIFACT_DIR", "models/artifacts"))
     lstm_path = artifact_dir / "lstm_predictor.keras"
     mlp_path = artifact_dir / "mlp_recommender.keras"
+    mlp_aux_path = artifact_dir / "mlp_aux.joblib"
 
-    if not lstm_path.exists() or not mlp_path.exists():
-        raise RuntimeError(
-            "Model artifacts not found. Train models before starting API. "
-            f"Expected {lstm_path} and {mlp_path}"
-        )
+    lstm_model: keras.Model | None = None
+    mlp_model: keras.Model | None = None
+    mlp_aux: dict[str, Any] | None = None
 
-    lstm_model = keras.models.load_model(lstm_path)
-    mlp_model = keras.models.load_model(mlp_path)
+    if lstm_path.exists():
+        lstm_model = keras.models.load_model(lstm_path)
+    else:
+        LOGGER.warning("lstm_predictor.keras missing; legacy /predict and /forecast unavailable")
+
+    if mlp_path.exists() and mlp_aux_path.exists():
+        mlp_model = keras.models.load_model(mlp_path)
+        mlp_aux = joblib.load(mlp_aux_path)
+    else:
+        LOGGER.warning("MLP recommender artifacts missing; /recommend unavailable")
 
     lstm_metadata = _read_json(artifact_dir / "lstm_metadata.json", fallback={"version": "unknown", "metrics": {}})
     mlp_metadata = _read_json(artifact_dir / "mlp_metadata.json", fallback={"version": "unknown", "metrics": {}})
-    mlp_aux = joblib.load(artifact_dir / "mlp_aux.joblib")
 
-    registry = ModelRegistry(
+    if ensemble is None and lstm_model is None:
+        raise RuntimeError(
+            "No usable models found. Provide ensemble (xgb_multiclass_model.json + mlp/lstm multiclass) "
+            f"and/or {lstm_path.name} under {artifact_dir}"
+        )
+
+    return ModelRegistry(
         lstm_model=lstm_model,
         mlp_model=mlp_model,
         lstm_metadata=lstm_metadata,
         mlp_metadata=mlp_metadata,
         mlp_aux=mlp_aux,
+        ensemble=ensemble,
     )
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global registry
+
+    artifact_dir = Path(os.getenv("MODEL_ARTIFACT_DIR", "models/artifacts"))
+    registry = _load_models(artifact_dir)
 
     registry.ingest_task = asyncio.create_task(_periodic_ingestion_loop())
     LOGGER.info("API lifespan startup complete")
@@ -127,7 +189,21 @@ async def lifespan(_: FastAPI):
         LOGGER.info("API lifespan shutdown complete")
 
 
-app = FastAPI(title="LuxAeterna", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="LuxAeterna", version="1.1.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/", include_in_schema=False)
+async def root() -> RedirectResponse:
+    """Browser default; this API has no HTML homepage — send people to interactive docs."""
+    return RedirectResponse(url="/docs")
 
 
 def _require_registry() -> ModelRegistry:
@@ -136,15 +212,50 @@ def _require_registry() -> ModelRegistry:
     return registry
 
 
+def _capabilities(state: ModelRegistry) -> dict[str, bool]:
+    ensemble_on = state.ensemble is not None
+    return {
+        "legacy_alqs_predict": state.lstm_model is not None,
+        "legacy_forecast": state.lstm_model is not None,
+        "legacy_recommend": state.mlp_model is not None and state.mlp_aux is not None,
+        "lighting_event_ensemble": ensemble_on,
+        "predict_event_from_location": ensemble_on,
+        "shooting_coach": True,
+    }
+
+
 async def _persist_feedback(payload: dict[str, Any], log_path: Path) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     async with aiofiles.open(log_path, mode="a", encoding="utf-8") as handle:
         await handle.write(json.dumps(payload) + "\n")
 
 
+def _predict_lighting_event_arrays(
+    state: ModelRegistry,
+    seq: np.ndarray,
+    tab: np.ndarray,
+) -> PredictLightingEventResponse:
+    if state.ensemble is None:
+        raise HTTPException(status_code=503, detail="Lighting ensemble not loaded (missing multiclass artifacts)")
+    probs = predict_lighting_event_probs(state.ensemble, seq, tab)
+    predicted_id = int(np.argmax(probs))
+    scores = [
+        LightingClassScore(class_id=i, label=CLASS_LABELS[i], probability=float(probs[i]))
+        for i in range(len(CLASS_LABELS))
+    ]
+    return PredictLightingEventResponse(
+        predicted_class_id=predicted_id,
+        predicted_label=CLASS_LABELS[predicted_id],
+        class_probabilities=scores,
+        ensemble_weights={"xgb": WEIGHT_XGB, "lstm": WEIGHT_LSTM, "mlp": WEIGHT_MLP},
+    )
+
+
 @app.post("/predict", response_model=PredictResponse)
 async def predict(request: FeatureWindowRequest) -> PredictResponse:
     state = _require_registry()
+    if state.lstm_model is None:
+        raise HTTPException(status_code=503, detail="Legacy LSTM regressor not loaded")
 
     x = np.asarray(request.feature_window, dtype=np.float32).reshape(1, 24, 7)
     pred = float(state.lstm_model.predict(x, verbose=0).reshape(-1)[0])
@@ -160,9 +271,85 @@ async def predict(request: FeatureWindowRequest) -> PredictResponse:
     )
 
 
+@app.post("/predict/event", response_model=PredictLightingEventResponse)
+async def predict_lighting_event(request: PredictLightingEventRequest) -> PredictLightingEventResponse:
+    state = _require_registry()
+    seq, tab = nan_safe_arrays(request.sequence, request.tabular)
+    return _predict_lighting_event_arrays(state, seq, tab)
+
+
+@app.post("/predict/event/from_location", response_model=PredictFromLocationResponse)
+async def predict_lighting_from_location(request: PredictFromLocationRequest) -> PredictFromLocationResponse:
+    state = _require_registry()
+    if state.ensemble is None:
+        raise HTTPException(status_code=503, detail="Lighting ensemble not loaded (missing multiclass artifacts)")
+
+    try:
+        frame = await asyncio.to_thread(
+            fetch_forecast_hourly_dataframe,
+            request.latitude,
+            request.longitude,
+            past_hours=request.past_hours,
+        )
+        sequence, tabular, meta = await asyncio.to_thread(
+            build_ensemble_arrays,
+            frame,
+            request.latitude,
+            request.longitude,
+        )
+        seq, tab = nan_safe_arrays(sequence, tabular)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Open-Meteo request failed: {exc}") from exc
+
+    pred = _predict_lighting_event_arrays(state, seq, tab)
+    coach = build_rules_coach(
+        predicted_label=pred.predicted_label,
+        predicted_class_id=pred.predicted_class_id,
+        class_probabilities=pred.class_probabilities,
+        weather_snapshot=meta["snapshot"],
+    )
+    coach = await asyncio.to_thread(
+        maybe_enrich_coach_with_openai,
+        coach,
+        class_probabilities=pred.class_probabilities,
+        weather_snapshot=meta["snapshot"],
+    )
+
+    return PredictFromLocationResponse(
+        latitude=request.latitude,
+        longitude=request.longitude,
+        reference_time_utc=meta["reference_time_utc"],
+        weather_snapshot=meta["snapshot"],
+        prediction=pred,
+        coach=coach,
+    )
+
+
+@app.post("/coach/shooting", response_model=CoachFromPredictionResponse)
+async def coach_shooting(request: CoachFromPredictionRequest) -> CoachFromPredictionResponse:
+    """Agentic-style shooting tips from class probabilities + weather (no model re-run)."""
+    coach = build_rules_coach(
+        predicted_label=request.predicted_label,
+        predicted_class_id=request.predicted_class_id,
+        class_probabilities=request.class_probabilities,
+        weather_snapshot=request.weather_snapshot,
+    )
+    coach = await asyncio.to_thread(
+        maybe_enrich_coach_with_openai,
+        coach,
+        class_probabilities=request.class_probabilities,
+        weather_snapshot=request.weather_snapshot,
+    )
+    return CoachFromPredictionResponse(coach=coach)
+
+
 @app.post("/recommend", response_model=RecommendResponse)
 async def recommend(request: RecommendRequest) -> RecommendResponse:
     state = _require_registry()
+    if state.mlp_model is None or state.mlp_aux is None:
+        raise HTTPException(status_code=503, detail="MLP recommender not loaded")
 
     alqs_scaler = state.mlp_aux["alqs_scaler"]
     weather_encoder = state.mlp_aux["weather_encoder"]
@@ -191,6 +378,8 @@ async def recommend(request: RecommendRequest) -> RecommendResponse:
 @app.get("/forecast", response_model=ForecastResponse)
 async def forecast() -> ForecastResponse:
     state = _require_registry()
+    if state.lstm_model is None:
+        raise HTTPException(status_code=503, detail="Legacy LSTM regressor not loaded")
 
     latest_window_path = Path("data/processed/latest_window.npy")
     if latest_window_path.exists():
@@ -229,11 +418,23 @@ async def feedback(request: FeedbackRequest, background_tasks: BackgroundTasks) 
 @app.get("/status", response_model=StatusResponse)
 async def status() -> StatusResponse:
     state = _require_registry()
+    caps = _capabilities(state)
+    ensemble_event: dict[str, Any] | None = None
+    if state.ensemble is not None:
+        ensemble_event = {
+            "blend_weights": {"xgb": WEIGHT_XGB, "lstm": WEIGHT_LSTM, "mlp": WEIGHT_MLP},
+            "xgboost_classifier": state.ensemble.metadata.get("xgb_multiclass_metadata"),
+            "lstm_multiclass": state.ensemble.metadata.get("lstm_multiclass_metadata"),
+            "mlp_multiclass": state.ensemble.metadata.get("mlp_multiclass_metadata"),
+        }
     return StatusResponse(
         api_status="ok",
         lstm_model_version=str(state.lstm_metadata.get("version", "unknown")),
         mlp_model_version=str(state.mlp_metadata.get("version", "unknown")),
         data_freshness_minutes=_compute_data_freshness_minutes(),
+        capabilities=caps,
+        ensemble_event_model_loaded=state.ensemble is not None,
+        ensemble_event=ensemble_event,
     )
 
 

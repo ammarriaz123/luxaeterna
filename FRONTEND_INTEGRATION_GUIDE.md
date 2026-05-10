@@ -1,6 +1,8 @@
 # Frontend & Backend Integration Guide: Lighting Prediction Ensemble
 
-This document outlines how the client application (Frontend/Backend) should interface with the LuxAeterna forecasting models to predict exceptional lighting events. 
+This document outlines how the client application (Frontend/Backend) should interface with the LuxAeterna forecasting models to predict exceptional lighting events.
+
+**API:** Send the **`sequence`** (6×10) and **`tabular`** (21) JSON body to **`POST /predict/event`** on the FastAPI server (same feature order as `api/ensemble_bundle.py`). Legacy **`POST /predict`** uses a different 24×7 ALQS window and is unrelated to this ensemble. 
 
 ## 1. The Core Paradigm
 The production model **does not process imagery**. It evaluates **sequential weather data** and **solar positioning** to predict the future lighting quality (3 hours ahead) without the need for live webcams.

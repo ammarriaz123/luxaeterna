@@ -6,7 +6,9 @@ import logging
 import os
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone as dt_timezone
+
+UTC = dt_timezone.utc
 from pathlib import Path
 from typing import Any
 
