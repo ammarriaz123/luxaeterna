@@ -102,7 +102,7 @@ Important variables:
 - MODEL_ARTIFACT_DIR: folder with `models/artifacts` (ensemble + optional legacy)
 - CORS_ORIGINS: comma-separated origins for the web app (e.g. Vite on :5173)
 - INGEST_STORAGE: `parquet` or `sqlite` for background weather pulls
-- **Shooting coach (optional LLM):** `COACH_LLM` set to `1`, `true`, `yes`, or `on` plus `OPENAI_API_KEY` to enrich rules with OpenAI; `COACH_OPENAI_MODEL` (default `gpt-4o-mini`) selects the chat model
+- **Shooting coach (optional LLM):** `COACH_LLM` set to `1`, `true`, `yes`, or `on` plus an API key (`OPENAI_API_KEY`, `GROQ_API_KEY`, or `COACH_LLM_API_KEY`). Uses OpenAI-compatible Chat Completions: default base is OpenAI, or Groq when `GROQ_API_KEY` is set or the key looks like `gsk_...`. Optional `COACH_LLM_BASE_URL` overrides the base (e.g. `https://api.groq.com/openai/v1`). `COACH_OPENAI_MODEL` / `COACH_LLM_MODEL` select the model (Groq defaults to `llama-3.3-70b-versatile` when the endpoint is Groq and the model is still an OpenAI default). `COACH_LLM_BACKEND`: `openai_http` (default) or `langgraph`
 
 Security note:
 
@@ -215,7 +215,7 @@ Output: class probabilities, predicted label, ensemble weights.
 
 ### POST /predict/event/from_location
 
-**Same ensemble as `/predict/event`**, but the server fetches Open-Meteo for **`latitude`**, **`longitude`**, and **`past_hours`** (24–240), builds `sequence` + `tabular`, runs inference, and returns **`weather_snapshot`**, **`prediction`**, and **`coach`** (rules; optional OpenAI when `COACH_LLM` + `OPENAI_API_KEY` are set).
+**Same ensemble as `/predict/event`**, but the server fetches Open-Meteo for **`latitude`**, **`longitude`**, and **`past_hours`** (24–240), builds `sequence` + `tabular`, runs inference, and returns **`weather_snapshot`**, **`prediction`**, and **`coach`** (rules; optional LLM when `COACH_LLM` and a coach API key are set — OpenAI or Groq; see Configuration).
 
 ### POST /coach/shooting
 

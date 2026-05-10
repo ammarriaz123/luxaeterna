@@ -1,4 +1,7 @@
-"""Rules-first shooting coach; optional OpenAI narrative when COACH_LLM=1 and OPENAI_API_KEY is set."""
+"""Rules-first shooting coach with optional LLM enrichment.
+
+Uses any OpenAI-compatible Chat Completions API (OpenAI, Groq, etc.) via env.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +16,20 @@ from api.schemas import CoachRecommendation, LightingClassScore
 
 LOGGER = logging.getLogger("luxaeterna.api.coach")
 
-OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+_DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+_DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
+
+try:
+    from typing import TypedDict
+
+    from langchain_openai import ChatOpenAI
+    from langchain_core.prompts import ChatPromptTemplate
+    from langgraph.graph import END, StateGraph
+
+    _LANGGRAPH_AVAILABLE = True
+except Exception:
+    _LANGGRAPH_AVAILABLE = False
+    TypedDict = dict  # type: ignore[assignment,misc]
 
 
 def build_rules_coach(
@@ -110,13 +126,176 @@ def build_rules_coach(
     )
 
 
+def _coach_llm_api_key() -> str:
+    """Prefer explicit coach key, then OpenAI-compatible env names, then Groq."""
+    return (
+        os.getenv("COACH_LLM_API_KEY", "").strip()
+        or os.getenv("OPENAI_API_KEY", "").strip()
+        or os.getenv("GROQ_API_KEY", "").strip()
+    )
+
+
+def _coach_llm_base_url() -> str:
+    """OpenAI-compatible API root (no trailing slash), e.g. https://api.openai.com/v1 or Groq."""
+    explicit = os.getenv("COACH_LLM_BASE_URL", "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    key = _coach_llm_api_key()
+    if os.getenv("GROQ_API_KEY", "").strip() or key.startswith("gsk_"):
+        return "https://api.groq.com/openai/v1"
+    return "https://api.openai.com/v1"
+
+
+def _is_groq_base(url: str) -> bool:
+    return "groq.com" in url.lower()
+
+
+def _coach_llm_model(base_url: str) -> str:
+    raw = (os.getenv("COACH_OPENAI_MODEL") or os.getenv("COACH_LLM_MODEL") or "").strip()
+    if not raw:
+        return _DEFAULT_GROQ_MODEL if _is_groq_base(base_url) else _DEFAULT_OPENAI_MODEL
+    if _is_groq_base(base_url) and raw in ("gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"):
+        return _DEFAULT_GROQ_MODEL
+    return raw
+
+
+def _chat_completions_url(base_url: str) -> str:
+    return f"{base_url.rstrip('/')}/chat/completions"
+
+
 def _coach_llm_enabled() -> bool:
-    return bool(os.getenv("OPENAI_API_KEY")) and os.getenv("COACH_LLM", "").strip().lower() in (
+    return bool(_coach_llm_api_key()) and os.getenv("COACH_LLM", "").strip().lower() in (
         "1",
         "true",
         "yes",
         "on",
     )
+
+
+def _coach_backend() -> str:
+    """LLM backend selector.
+
+    - "openai_http": existing direct HTTP call
+    - "langgraph": LangChain+LangGraph prompt graph (falls back on failure)
+    """
+    raw = os.getenv("COACH_LLM_BACKEND", "openai_http").strip().lower()
+    if raw in {"langgraph", "langchain"}:
+        return "langgraph"
+    return "openai_http"
+
+
+def _build_llm_user_message(
+    *,
+    base: CoachRecommendation,
+    class_probabilities: list[LightingClassScore],
+    weather_snapshot: dict[str, Any],
+) -> str:
+    probs_line = ", ".join(f"{c.label}:{c.probability:.2f}" for c in class_probabilities)
+    return (
+        f"Predicted lighting event: {base.predicted_label}. "
+        f"Class probabilities: {probs_line}. "
+        f"Latest weather snapshot JSON: {json.dumps(weather_snapshot)}. "
+        "You are a photography coach. In 3–5 short bullet sentences, add creative shooting advice "
+        "(composition, exposure mindset, one lens idea). No equipment sales. Plain text only, no markdown."
+    )
+
+
+def _enrich_with_langgraph(
+    *,
+    base: CoachRecommendation,
+    class_probabilities: list[LightingClassScore],
+    weather_snapshot: dict[str, Any],
+) -> str:
+    if not _LANGGRAPH_AVAILABLE:
+        raise RuntimeError("LangGraph/LangChain packages not installed")
+
+    api_root = _coach_llm_base_url()
+    model = _coach_llm_model(api_root)
+    key = _coach_llm_api_key()
+
+    class CoachGraphState(TypedDict):
+        user_message: str
+        llm_output: str
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", "You assist photographers with concise, practical advice. Output plain text only."),
+            ("user", "{user_message}"),
+        ]
+    )
+    llm = ChatOpenAI(
+        model=model,
+        api_key=key,
+        base_url=api_root,
+        temperature=0.6,
+        max_tokens=300,
+    )
+
+    def draft_node(state: CoachGraphState) -> CoachGraphState:
+        chain = prompt | llm
+        response = chain.invoke({"user_message": state["user_message"]})
+        return {
+            "user_message": state["user_message"],
+            "llm_output": str(getattr(response, "content", "")).strip(),
+        }
+
+    graph = StateGraph(CoachGraphState)
+    graph.add_node("draft", draft_node)
+    graph.set_entry_point("draft")
+    graph.add_edge("draft", END)
+    app = graph.compile()
+
+    out = app.invoke(
+        {
+            "user_message": _build_llm_user_message(
+                base=base,
+                class_probabilities=class_probabilities,
+                weather_snapshot=weather_snapshot,
+            ),
+            "llm_output": "",
+        }
+    )
+    return str(out.get("llm_output", "")).strip()
+
+
+def _enrich_with_openai_http(
+    *,
+    base: CoachRecommendation,
+    class_probabilities: list[LightingClassScore],
+    weather_snapshot: dict[str, Any],
+) -> str:
+    api_root = _coach_llm_base_url()
+    key = _coach_llm_api_key()
+    model = _coach_llm_model(api_root)
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You assist photographers with concise, practical advice. Output plain text only.",
+            },
+            {
+                "role": "user",
+                "content": _build_llm_user_message(
+                    base=base,
+                    class_probabilities=class_probabilities,
+                    weather_snapshot=weather_snapshot,
+                ),
+            },
+        ],
+        "max_tokens": 300,
+        "temperature": 0.6,
+    }
+    with httpx.Client(timeout=60.0) as client:
+        r = client.post(
+            _chat_completions_url(api_root),
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json=payload,
+        )
+        r.raise_for_status()
+        data = r.json()
+    text = (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+    return str(text).strip()
 
 
 def maybe_enrich_coach_with_openai(
@@ -128,39 +307,21 @@ def maybe_enrich_coach_with_openai(
     if not _coach_llm_enabled():
         return base
 
-    key = os.getenv("OPENAI_API_KEY", "")
-    model = os.getenv("COACH_OPENAI_MODEL", "gpt-4o-mini")
     try:
-        probs_line = ", ".join(f"{c.label}:{c.probability:.2f}" for c in class_probabilities)
-        user = (
-            f"Predicted lighting event: {base.predicted_label}. "
-            f"Class probabilities: {probs_line}. "
-            f"Latest weather snapshot JSON: {json.dumps(weather_snapshot)}. "
-            "You are a photography coach. In 3–5 short bullet sentences, add creative shooting advice "
-            "(composition, exposure mindset, one lens idea). No equipment sales. Plain text only, no markdown."
-        )
-        payload = {
-            "model": model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You assist photographers with concise, practical advice. Output plain text only.",
-                },
-                {"role": "user", "content": user},
-            ],
-            "max_tokens": 300,
-            "temperature": 0.6,
-        }
-        with httpx.Client(timeout=60.0) as client:
-            r = client.post(
-                OPENAI_URL,
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json=payload,
+        backend = _coach_backend()
+        if backend == "langgraph":
+            text = _enrich_with_langgraph(
+                base=base,
+                class_probabilities=class_probabilities,
+                weather_snapshot=weather_snapshot,
             )
-            r.raise_for_status()
-            data = r.json()
-        text = (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
-        text = str(text).strip()
+        else:
+            text = _enrich_with_openai_http(
+                base=base,
+                class_probabilities=class_probabilities,
+                weather_snapshot=weather_snapshot,
+            )
+
         if not text:
             return base
         return base.model_copy(
@@ -170,5 +331,6 @@ def maybe_enrich_coach_with_openai(
             }
         )
     except Exception as exc:
-        LOGGER.warning("OpenAI coach enrichment failed: %s", exc)
+        LOGGER.warning("Coach enrichment failed with backend '%s': %s", _coach_backend(), exc)
+        # Never break the endpoint; always degrade to rules-only response.
         return base
