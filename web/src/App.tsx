@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   coachShooting,
   demoLightingRequest,
@@ -237,6 +237,14 @@ export default function App() {
   const [emailNotifyOn, setEmailNotifyOn] = useState(getEmailNotifyPreference);
   const [emailAddress, setEmailAddress] = useState(getSavedEmail);
   const [emailBusy, setEmailBusy] = useState(false);
+  const [emailSuccess, setEmailSuccess] = useState<string | null>(null);
+  const locationResultsRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!emailSuccess) return;
+    const t = window.setTimeout(() => setEmailSuccess(null), 5500);
+    return () => window.clearTimeout(t);
+  }, [emailSuccess]);
 
   const refresh = useCallback(async () => {
     setErr(null);
@@ -301,6 +309,9 @@ export default function App() {
       setLocationBundle(bundle);
       firePredictionNotification(bundle.prediction, "Location analysis ready");
       setHourlyLastReference(bundle.reference_time_utc);
+      window.setTimeout(() => {
+        locationResultsRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }, 120);
     } catch (e) {
       setLocErr(e instanceof Error ? e.message : "Location prediction failed");
     } finally {
@@ -410,8 +421,9 @@ export default function App() {
     }
     setEmailBusy(true);
     setLocErr(null);
+    setEmailSuccess(null);
     try {
-      await setEmailSubscription({
+      const res = await setEmailSubscription({
         email: normalizedEmail,
         latitude: location.latitude,
         longitude: location.longitude,
@@ -421,6 +433,15 @@ export default function App() {
       setEmailNotifyOn(next);
       setEmailNotifyPreference(next);
       setSavedEmail(normalizedEmail);
+      if (next) {
+        setEmailSuccess(
+          res.status === "subscribed"
+            ? "Hourly emails are on for this spot — we saved your address and coordinates."
+            : "Preferences saved — hourly emails stay aligned with this location.",
+        );
+      } else {
+        setEmailSuccess("Hourly emails are off for this address on the server.");
+      }
     } catch (e) {
       setLocErr(e instanceof Error ? e.message : "Email subscription failed");
     } finally {
@@ -570,6 +591,11 @@ export default function App() {
           </div>
           {notifPerm === "denied" && <span className="small muted">Notifications blocked—enable them in the browser site settings.</span>}
           {notifPerm === "unsupported" && <span className="small muted">Notifications not available in this context.</span>}
+          {emailSuccess && (
+            <p className="banner banner--ok small" role="status" aria-live="polite">
+              {emailSuccess}
+            </p>
+          )}
           <span className="small muted">Tip: opt-in captures the current lat/lon and past-hours values as your alert location.</span>
         </div>
 
@@ -610,7 +636,7 @@ export default function App() {
         {locErr && <p className="banner banner--err mono small">{locErr}</p>}
 
         {locationBundle && (
-          <div className="results-stack">
+          <div className="results-stack" ref={locationResultsRef}>
             <p className="meta-line mono small">
               <span className="muted">Reference (UTC)</span> {locationBundle.reference_time_utc.slice(0, 19).replace("T", " ")} ·{" "}
               <span className="muted">Coords</span> {locationBundle.latitude.toFixed(4)}, {locationBundle.longitude.toFixed(4)}

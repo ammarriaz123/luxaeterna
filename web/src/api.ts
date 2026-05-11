@@ -55,10 +55,72 @@ export type EmailSubscriptionPayload = {
   enabled: boolean;
 };
 
+function tryParseJson(text: string): unknown {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function detailToMessage(detail: unknown): string | null {
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    const parts: string[] = [];
+    for (const item of detail) {
+      if (item && typeof item === "object" && "msg" in item) {
+        const o = item as { loc?: unknown[]; msg?: unknown };
+        const loc = Array.isArray(o.loc)
+          ? o.loc
+              .filter((x): x is string | number => x !== "body" && typeof x !== "object")
+              .join(".")
+          : "";
+        const msg = String(o.msg ?? "");
+        parts.push(loc ? `${loc}: ${msg}` : msg);
+      } else {
+        parts.push(typeof item === "string" ? item : JSON.stringify(item));
+      }
+    }
+    const joined = parts.filter(Boolean).join("; ");
+    return joined || null;
+  }
+  return null;
+}
+
+/** Readable message for failed API responses (FastAPI `detail`, validation errors, short plain text). */
+export function messageFromFailedResponse(res: Response, bodyText: string): string {
+  const parsed = tryParseJson(bodyText);
+  if (parsed && typeof parsed === "object" && parsed !== null && "detail" in parsed) {
+    const fromDetail = detailToMessage((parsed as { detail: unknown }).detail);
+    if (fromDetail) {
+      if (res.status === 422) return `Check your input — ${fromDetail}`;
+      return fromDetail;
+    }
+  }
+
+  if (res.status === 502 || res.status === 503) {
+    return "The service is temporarily unavailable. Try again in a moment.";
+  }
+
+  if (res.status === 504) {
+    return "The request took too long. Try again with a shorter time window or later.";
+  }
+
+  if (bodyText) {
+    const line = bodyText.trim().split(/\r?\n/)[0]?.trim() ?? "";
+    if (line && !line.startsWith("<")) {
+      return line.length > 240 ? `${line.slice(0, 237)}…` : line;
+    }
+  }
+
+  if (res.status === 500) return "Something went wrong on the server.";
+  return res.statusText || "Request failed";
+}
+
 async function parseJson<T>(res: Response): Promise<T> {
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(text || res.statusText);
+    throw new Error(messageFromFailedResponse(res, text));
   }
   return res.json() as Promise<T>;
 }
