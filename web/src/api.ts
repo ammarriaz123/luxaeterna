@@ -199,6 +199,123 @@ export async function coachShooting(body: {
   return parseJson<{ coach: CoachRecommendation }>(res);
 }
 
+export type CoachStreamEvent =
+  | { type: "rules"; coach: CoachRecommendation }
+  | { type: "structured"; coach: CoachRecommendation }
+  | { type: "token"; text: string }
+  | { type: "final"; coach: CoachRecommendation }
+  | { type: "error"; message: string };
+
+export type SalleChatStreamEvent =
+  | { type: "start" }
+  | { type: "token"; text: string }
+  | { type: "done" }
+  | { type: "error"; message: string };
+
+/** Anchored Salle de conseil — multi-turn chat grounded in one analysis (SSE). */
+export async function coachAnchoredChatStream(
+  body: {
+    messages: { role: "user" | "assistant"; content: string }[];
+    context: {
+      latitude: number;
+      longitude: number;
+      reference_time_utc: string;
+      predicted_label: string;
+      predicted_class_id: number;
+      class_probabilities: LightingClassScore[];
+      weather_snapshot: Record<string, number>;
+      coach: CoachRecommendation;
+    };
+  },
+  onEvent: (ev: SalleChatStreamEvent) => void,
+): Promise<void> {
+  const res = await fetch(`${base}/coach/chat/stream`, {
+    method: "POST",
+    headers: { Accept: "text/event-stream", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(messageFromFailedResponse(res, text));
+  }
+  if (!res.body) {
+    throw new Error("No response body");
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop() ?? "";
+    for (const block of parts) {
+      for (const line of block.split("\n")) {
+        if (!line.startsWith("data: ")) continue;
+        const raw = line.slice(6).trim();
+        if (!raw) continue;
+        try {
+          const data = JSON.parse(raw) as SalleChatStreamEvent;
+          onEvent(data);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+}
+
+/** SSE: structured field refinements, streamed narrative, then final coach (same key as /coach/shooting). */
+export async function coachShootingStream(
+  body: {
+    predicted_class_id: number;
+    predicted_label: string;
+    class_probabilities: LightingClassScore[];
+    weather_snapshot?: Record<string, number>;
+  },
+  onEvent: (ev: CoachStreamEvent) => void,
+): Promise<void> {
+  const res = await fetch(`${base}/coach/shooting/stream`, {
+    method: "POST",
+    headers: { Accept: "text/event-stream", "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ...body,
+      weather_snapshot: body.weather_snapshot ?? {},
+    }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(messageFromFailedResponse(res, text));
+  }
+  if (!res.body) {
+    throw new Error("No response body");
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop() ?? "";
+    for (const block of parts) {
+      for (const line of block.split("\n")) {
+        if (!line.startsWith("data: ")) continue;
+        const raw = line.slice(6).trim();
+        if (!raw) continue;
+        try {
+          const data = JSON.parse(raw) as CoachStreamEvent;
+          onEvent(data);
+        } catch {
+          /* ignore malformed chunk */
+        }
+      }
+    }
+  }
+}
+
 export type EmailSubscriptionResponse = {
   status: "subscribed" | "updated" | "unsubscribed";
   subscription: Record<string, unknown>;

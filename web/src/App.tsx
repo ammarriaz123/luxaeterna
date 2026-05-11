@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   coachShooting,
+  coachShootingStream,
   demoLightingRequest,
   fetchHealth,
   fetchStatus,
@@ -13,6 +14,7 @@ import {
   type StatusPayload,
 } from "./api";
 import { BrandMark, MountainBackdrop } from "./BrandMark";
+import { CoachSalle } from "./CoachSalle";
 import { formatCoord, getCurrentPosition, GeolocationError, isGeolocationSupported } from "./geolocation";
 import {
   confidenceTier,
@@ -363,19 +365,59 @@ export default function App() {
     if (!locationBundle) return;
     setCoachRefreshing(true);
     setLocErr(null);
+    const bundle = locationBundle;
+    const body = {
+      predicted_class_id: bundle.prediction.predicted_class_id,
+      predicted_label: bundle.prediction.predicted_label,
+      class_probabilities: bundle.prediction.class_probabilities,
+      weather_snapshot: bundle.weather_snapshot,
+    };
     try {
-      const { coach } = await coachShooting({
-        predicted_class_id: locationBundle.prediction.predicted_class_id,
-        predicted_label: locationBundle.prediction.predicted_label,
-        class_probabilities: locationBundle.prediction.class_probabilities,
-        weather_snapshot: locationBundle.weather_snapshot,
+      let streamHadError = false;
+      await coachShootingStream(body, (ev) => {
+        if (ev.type === "structured") {
+          setLocationBundle((prev) => (prev ? { ...prev, coach: ev.coach } : null));
+        }
+        if (ev.type === "token") {
+          setLocationBundle((prev) => {
+            if (!prev) return null;
+            const c = prev.coach;
+            const addon = (c.llm_addon ?? "") + ev.text;
+            return {
+              ...prev,
+              coach: {
+                ...c,
+                llm_addon: addon,
+                source: addon ? "rules+openai" : c.source,
+              },
+            };
+          });
+        }
+        if (ev.type === "final") {
+          setLocationBundle((prev) => (prev ? { ...prev, coach: ev.coach } : null));
+        }
+        if (ev.type === "error") {
+          streamHadError = true;
+          setLocErr(ev.message);
+        }
       });
-      setLocationBundle({ ...locationBundle, coach });
-      if (getNotifyPreference() && notificationPermission() === "granted") {
+      if (
+        !streamHadError &&
+        getNotifyPreference() &&
+        notificationPermission() === "granted"
+      ) {
         notifyResult("Coach updated", "Fresh shooting tips are ready in the app.");
       }
-    } catch (e) {
-      setLocErr(e instanceof Error ? e.message : "Coach refresh failed");
+    } catch {
+      try {
+        const { coach } = await coachShooting(body);
+        setLocationBundle({ ...bundle, coach });
+        if (getNotifyPreference() && notificationPermission() === "granted") {
+          notifyResult("Coach updated", "Fresh shooting tips are ready in the app.");
+        }
+      } catch (e) {
+        setLocErr(e instanceof Error ? e.message : "Coach refresh failed");
+      }
     } finally {
       setCoachRefreshing(false);
     }
@@ -684,6 +726,7 @@ export default function App() {
               onRefreshCoach={caps?.shooting_coach ? () => void refreshCoachOnly() : undefined}
               coachRefreshing={coachRefreshing}
             />
+            <CoachSalle bundle={locationBundle} coachLlmEnabled={!!caps?.coach_llm} />
           </div>
         )}
       </section>
@@ -754,6 +797,7 @@ export default function App() {
               <CapabilityPill label="/predict/event" on={caps.lighting_event_ensemble} />
               <CapabilityPill label="/from_location" on={caps.predict_event_from_location ?? false} />
               <CapabilityPill label="/coach/shooting" on={caps.shooting_coach ?? false} />
+              <CapabilityPill label="Salle (LLM)" on={caps.coach_llm ?? false} />
             </div>
           )}
         </div>
