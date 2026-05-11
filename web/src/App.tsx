@@ -6,6 +6,7 @@ import {
   fetchStatus,
   predictFromLocation,
   predictLightingEvent,
+  setEmailSubscription,
   type CoachRecommendation,
   type LightingPrediction,
   type PredictFromLocationResponse,
@@ -21,11 +22,15 @@ import {
   verdictForPrediction,
 } from "./lightingCopy";
 import {
+  getHourlyLastReference,
+  getHourlyNotifyLocation,
   getNotifyPreference,
   isNotificationApiAvailable,
   notificationPermission,
   notifyResult,
   requestNotificationPermission,
+  setHourlyLastReference,
+  setHourlyNotifyLocation,
   setNotifyPreference,
 } from "./notify";
 
@@ -169,6 +174,43 @@ function firePredictionNotification(prediction: LightingPrediction, context: str
   notifyResult(context, `${v.notifySummary}\n${detail}`);
 }
 
+const EMAIL_NOTIFY_KEY = "luxaeterna_notify_email_on";
+const EMAIL_NOTIFY_VALUE_KEY = "luxaeterna_notify_email_value";
+
+function getEmailNotifyPreference(): boolean {
+  try {
+    return localStorage.getItem(EMAIL_NOTIFY_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function setEmailNotifyPreference(on: boolean): void {
+  try {
+    if (on) localStorage.setItem(EMAIL_NOTIFY_KEY, "1");
+    else localStorage.removeItem(EMAIL_NOTIFY_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+function getSavedEmail(): string {
+  try {
+    return localStorage.getItem(EMAIL_NOTIFY_VALUE_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function setSavedEmail(value: string): void {
+  try {
+    if (value) localStorage.setItem(EMAIL_NOTIFY_VALUE_KEY, value);
+    else localStorage.removeItem(EMAIL_NOTIFY_VALUE_KEY);
+  } catch {
+    // ignore
+  }
+}
+
 export default function App() {
   const [status, setStatus] = useState<StatusPayload | null>(null);
   const [health, setHealth] = useState<string | null>(null);
@@ -192,6 +234,9 @@ export default function App() {
   const [notifPerm, setNotifPerm] = useState<NotificationPermission | "unsupported">(
     isNotificationApiAvailable() ? notificationPermission() : "unsupported",
   );
+  const [emailNotifyOn, setEmailNotifyOn] = useState(getEmailNotifyPreference);
+  const [emailAddress, setEmailAddress] = useState(getSavedEmail);
+  const [emailBusy, setEmailBusy] = useState(false);
 
   const refresh = useCallback(async () => {
     setErr(null);
@@ -222,6 +267,15 @@ export default function App() {
     }
   }, []);
 
+  const parseCurrentLocation = () => {
+    const latitude = Number(lat);
+    const longitude = Number(lon);
+    const ph = Number(pastHours);
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
+    if (!Number.isFinite(ph) || ph < 24 || ph > 240) return null;
+    return { latitude, longitude, pastHours: Math.round(ph) };
+  };
+
   const runDemoPredict = async () => {
     setPredErr(null);
     setPredLoading(true);
@@ -246,6 +300,7 @@ export default function App() {
       const bundle = await predictFromLocation({ latitude, longitude, past_hours: ph });
       setLocationBundle(bundle);
       firePredictionNotification(bundle.prediction, "Location analysis ready");
+      setHourlyLastReference(bundle.reference_time_utc);
     } catch (e) {
       setLocErr(e instanceof Error ? e.message : "Location prediction failed");
     } finally {
@@ -322,6 +377,11 @@ export default function App() {
       setNotifyPreference(false);
       return;
     }
+    const location = parseCurrentLocation();
+    if (!location) {
+      setLocErr("Set valid latitude/longitude and past hours before hourly desktop alerts.");
+      return;
+    }
     if (!isNotificationApiAvailable()) return;
     const perm = await requestNotificationPermission();
     setNotifPerm(perm);
@@ -330,9 +390,85 @@ export default function App() {
       setNotifyPreference(false);
       return;
     }
+    setLocErr(null);
+    setHourlyNotifyLocation(location);
     setNotifyOn(true);
     setNotifyPreference(true);
   };
+
+  const toggleEmailNotify = async () => {
+    const next = !emailNotifyOn;
+    const location = parseCurrentLocation();
+    if (!location) {
+      setLocErr("Set valid latitude/longitude and past hours before email opt-in.");
+      return;
+    }
+    const normalizedEmail = emailAddress.trim().toLowerCase();
+    if (!normalizedEmail.includes("@")) {
+      setLocErr("Enter a valid email address for hourly updates.");
+      return;
+    }
+    setEmailBusy(true);
+    setLocErr(null);
+    try {
+      await setEmailSubscription({
+        email: normalizedEmail,
+        latitude: location.latitude,
+        longitude: location.longitude,
+        past_hours: location.pastHours,
+        enabled: next,
+      });
+      setEmailNotifyOn(next);
+      setEmailNotifyPreference(next);
+      setSavedEmail(normalizedEmail);
+    } catch (e) {
+      setLocErr(e instanceof Error ? e.message : "Email subscription failed");
+    } finally {
+      setEmailBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!notifyOn) return;
+    if (!isNotificationApiAvailable() || notificationPermission() !== "granted") return;
+
+    const msToNextHour = () => {
+      const now = Date.now();
+      const next = new Date(now);
+      next.setMinutes(0, 0, 0);
+      next.setMilliseconds(0);
+      if (next.getTime() <= now) next.setHours(next.getHours() + 1);
+      return Math.max(5_000, next.getTime() - now);
+    };
+
+    const tick = async () => {
+      const saved = getHourlyNotifyLocation();
+      if (!saved) return;
+      try {
+        const bundle = await predictFromLocation({
+          latitude: saved.latitude,
+          longitude: saved.longitude,
+          past_hours: saved.pastHours,
+        });
+        const last = getHourlyLastReference();
+        if (last === bundle.reference_time_utc) return;
+        firePredictionNotification(bundle.prediction, "Hourly location update");
+        setHourlyLastReference(bundle.reference_time_utc);
+      } catch {
+        // keep silent to avoid interrupting active users every hour on transient failures
+      }
+    };
+
+    let intervalId: number | undefined;
+    const timeoutId = window.setTimeout(() => {
+      void tick();
+      intervalId = window.setInterval(() => void tick(), 60 * 60 * 1000);
+    }, msToNextHour());
+    return () => {
+      window.clearTimeout(timeoutId);
+      if (intervalId !== undefined) window.clearInterval(intervalId);
+    };
+  }, [notifyOn]);
 
   const caps = status?.capabilities;
   const snap = locationBundle?.weather_snapshot;
@@ -416,10 +552,25 @@ export default function App() {
         <div className="notify-row">
           <label className="notify-toggle">
             <input type="checkbox" checked={notifyOn} onChange={() => void toggleNotify()} disabled={notifPerm === "unsupported"} />
-            <span>Desktop notification when analysis finishes</span>
+            <span>Hourly desktop update for this location (while this tab is open)</span>
           </label>
+          <div className="notify-email">
+            <input
+              className="field__input"
+              type="email"
+              value={emailAddress}
+              onChange={(e) => setEmailAddress(e.target.value)}
+              placeholder="you@example.com"
+              autoComplete="email"
+            />
+            <label className="notify-toggle">
+              <input type="checkbox" checked={emailNotifyOn} onChange={() => void toggleEmailNotify()} disabled={emailBusy} />
+              <span>{emailBusy ? "Saving…" : "Hourly email update for this location"}</span>
+            </label>
+          </div>
           {notifPerm === "denied" && <span className="small muted">Notifications blocked—enable them in the browser site settings.</span>}
           {notifPerm === "unsupported" && <span className="small muted">Notifications not available in this context.</span>}
+          <span className="small muted">Tip: opt-in captures the current lat/lon and past-hours values as your alert location.</span>
         </div>
 
         <div className="form-grid">

@@ -47,6 +47,14 @@ export type PredictFromLocationResponse = {
   coach: CoachRecommendation;
 };
 
+export type EmailSubscriptionPayload = {
+  email: string;
+  latitude: number;
+  longitude: number;
+  past_hours?: number;
+  enabled: boolean;
+};
+
 async function parseJson<T>(res: Response): Promise<T> {
   if (!res.ok) {
     const text = await res.text();
@@ -127,4 +135,21 @@ export async function coachShooting(body: {
     }),
   });
   return parseJson<{ coach: CoachRecommendation }>(res);
+}
+
+export type EmailSubscriptionResponse = {
+  status: "subscribed" | "updated" | "unsubscribed";
+  subscription: Record<string, unknown>;
+};
+
+export async function setEmailSubscription(body: EmailSubscriptionPayload): Promise<EmailSubscriptionResponse> {
+  const res = await fetch(`${base}/notifications/email-subscription`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ...body,
+      past_hours: body.past_hours ?? 72,
+    }),
+  });
+  return parseJson<EmailSubscriptionResponse>(res);
 }

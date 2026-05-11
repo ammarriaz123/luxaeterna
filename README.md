@@ -103,6 +103,7 @@ Important variables:
 - CORS_ORIGINS: comma-separated origins for the web app (e.g. Vite on :5173)
 - INGEST_STORAGE: `parquet` or `sqlite` for background weather pulls
 - **Shooting coach (optional LLM):** `COACH_LLM` set to `1`, `true`, `yes`, or `on` plus an API key (`OPENAI_API_KEY`, `GROQ_API_KEY`, or `COACH_LLM_API_KEY`). Uses OpenAI-compatible Chat Completions: default base is OpenAI, or Groq when `GROQ_API_KEY` is set or the key looks like `gsk_...`. Optional `COACH_LLM_BASE_URL` overrides the base (e.g. `https://api.groq.com/openai/v1`). `COACH_OPENAI_MODEL` / `COACH_LLM_MODEL` select the model (Groq defaults to `llama-3.3-70b-versatile` when the endpoint is Groq and the model is still an OpenAI default). `COACH_LLM_BACKEND`: `openai_http` (default) or `langgraph`
+- **Hourly email alerts (optional):** The web UI can register an address via `POST /notifications/email-subscription`. The API persists subscriptions and sends at most one message per subscriber per clock hour when **`SMTP_HOST`**, **`SMTP_PORT`**, and **`SMTP_FROM`** are set (optional **`SMTP_USERNAME`** / **`SMTP_PASSWORD`**, **`SMTP_USE_TLS`** default `1`). Without SMTP, subscriptions are still saved but no mail is sent (check server logs). Optional **`NOTIFY_INTERVAL_SECONDS`** (e.g. `3600` or `1h`) overrides the default top-of-hour schedule; **`EMAIL_SUBSCRIPTIONS_PATH`** overrides the JSON file location (default `data/processed/email_subscriptions.json`).
 
 Security note:
 
@@ -220,6 +221,10 @@ Output: class probabilities, predicted label, ensemble weights.
 ### POST /coach/shooting
 
 **Shooting / camera recommendations** from an existing **`predicted_class_id`**, **`predicted_label`**, **`class_probabilities`**, and optional **`weather_snapshot`** — no model re-run. Same rules + optional LLM enrichment as the location endpoint.
+
+### POST /notifications/email-subscription
+
+Register or update hourly lighting emails for a coordinate window. Body: **`email`**, **`latitude`**, **`longitude`**, **`past_hours`** (24–240), **`enabled`**. Persists to disk (see **`EMAIL_SUBSCRIPTIONS_PATH`**). Background task sends one email per hour per subscriber when SMTP env vars are set; uses the same Open-Meteo → ensemble path as **`/predict/event/from_location`** (rules-only summary in the message).
 
 ### GET /forecast
 

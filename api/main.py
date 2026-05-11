@@ -5,7 +5,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 
 UTC = timezone.utc
@@ -41,9 +41,18 @@ from api.lighting_features import (
     fetch_forecast_hourly_dataframe,
     nan_safe_arrays,
 )
+from api.notifications import (
+    is_smtp_configured,
+    list_enabled_subscriptions,
+    mark_subscription_sent,
+    send_hourly_email,
+    upsert_email_subscription,
+)
 from api.schemas import (
     CoachFromPredictionRequest,
     CoachFromPredictionResponse,
+    EmailSubscriptionRequest,
+    EmailSubscriptionResponse,
     FeedbackRequest,
     FeedbackResponse,
     FeatureWindowRequest,
@@ -74,9 +83,11 @@ class ModelRegistry:
     mlp_aux: dict[str, Any] | None
     ensemble: EnsembleBundle | None
     ingest_task: asyncio.Task[None] | None = None
+    notify_task: asyncio.Task[None] | None = None
 
 
 registry: ModelRegistry | None = None
+_smtp_missing_logged: bool = False
 
 
 def _read_json(path: Path, fallback: dict[str, Any]) -> dict[str, Any]:
@@ -119,6 +130,104 @@ async def _periodic_ingestion_loop() -> None:
             LOGGER.exception("Background ingestion failed: %s", exc)
 
         await asyncio.sleep(interval)
+
+
+def _seconds_until_next_hour() -> float:
+    now = datetime.now(UTC)
+    next_hour = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
+    return max(5.0, (next_hour - now).total_seconds())
+
+
+def _interval_to_seconds(raw: str) -> float:
+    value = raw.strip().lower()
+    if value.endswith("h"):
+        return float(value[:-1]) * 3600.0
+    if value.endswith("m"):
+        return float(value[:-1]) * 60.0
+    if value.endswith("s"):
+        return float(value[:-1])
+    return float(value)
+
+
+def _notify_sleep_seconds() -> float:
+    raw = os.getenv("NOTIFY_INTERVAL_SECONDS", "").strip()
+    if not raw:
+        return _seconds_until_next_hour()
+    try:
+        return max(10.0, _interval_to_seconds(raw))
+    except ValueError:
+        LOGGER.warning("Invalid NOTIFY_INTERVAL_SECONDS=%r; falling back to top-of-hour schedule", raw)
+        return _seconds_until_next_hour()
+
+
+def _notification_key(reference_time_utc: str) -> str:
+    try:
+        ts = datetime.fromisoformat(reference_time_utc.replace("Z", "+00:00"))
+        return ts.astimezone(UTC).replace(minute=0, second=0, microsecond=0).isoformat()
+    except ValueError:
+        return reference_time_utc
+
+
+async def _send_hourly_notifications_once(state: ModelRegistry) -> None:
+    global _smtp_missing_logged
+    subs = await asyncio.to_thread(list_enabled_subscriptions)
+    if not subs:
+        return
+    if not await asyncio.to_thread(is_smtp_configured):
+        if not _smtp_missing_logged:
+            LOGGER.warning(
+                "Hourly email subscriptions are registered but SMTP is not configured "
+                "(set SMTP_HOST, SMTP_PORT, SMTP_FROM). Skipping sends until configured."
+            )
+            _smtp_missing_logged = True
+        return
+    if state.ensemble is None:
+        LOGGER.warning("Skipping hourly notifications because ensemble is unavailable")
+        return
+
+    for sub in subs:
+        try:
+            frame = await asyncio.to_thread(
+                fetch_forecast_hourly_dataframe,
+                sub.latitude,
+                sub.longitude,
+                past_hours=sub.past_hours,
+            )
+            sequence, tabular, meta = await asyncio.to_thread(
+                build_ensemble_arrays,
+                frame,
+                sub.latitude,
+                sub.longitude,
+            )
+            seq, tab = nan_safe_arrays(sequence, tabular)
+            pred = _predict_lighting_event_arrays(state, seq, tab)
+            ref_key = _notification_key(meta["reference_time_utc"])
+            if sub.last_reference_time_utc == ref_key:
+                continue
+            await asyncio.to_thread(
+                send_hourly_email,
+                to_email=sub.email,
+                reference_time_utc=meta["reference_time_utc"],
+                latitude=sub.latitude,
+                longitude=sub.longitude,
+                predicted_label=pred.predicted_label,
+                scores=pred.class_probabilities,
+            )
+            await asyncio.to_thread(mark_subscription_sent, sub.email, ref_key)
+        except Exception as exc:
+            LOGGER.exception("Hourly notify failed for %s: %s", sub.email, exc)
+
+
+async def _periodic_notification_loop() -> None:
+    while True:
+        await asyncio.sleep(_notify_sleep_seconds())
+        state = registry
+        if state is None:
+            continue
+        try:
+            await _send_hourly_notifications_once(state)
+        except Exception as exc:
+            LOGGER.exception("Hourly notification loop tick failed: %s", exc)
 
 
 def _load_models(artifact_dir: Path) -> ModelRegistry:
@@ -175,6 +284,7 @@ async def lifespan(_: FastAPI):
     registry = _load_models(artifact_dir)
 
     registry.ingest_task = asyncio.create_task(_periodic_ingestion_loop())
+    registry.notify_task = asyncio.create_task(_periodic_notification_loop())
     LOGGER.info("API lifespan startup complete")
 
     try:
@@ -184,6 +294,12 @@ async def lifespan(_: FastAPI):
             registry.ingest_task.cancel()
             try:
                 await registry.ingest_task
+            except asyncio.CancelledError:
+                pass
+        if registry and registry.notify_task:
+            registry.notify_task.cancel()
+            try:
+                await registry.notify_task
             except asyncio.CancelledError:
                 pass
         LOGGER.info("API lifespan shutdown complete")
@@ -343,6 +459,19 @@ async def coach_shooting(request: CoachFromPredictionRequest) -> CoachFromPredic
         weather_snapshot=request.weather_snapshot,
     )
     return CoachFromPredictionResponse(coach=coach)
+
+
+@app.post("/notifications/email-subscription", response_model=EmailSubscriptionResponse)
+async def set_email_subscription(request: EmailSubscriptionRequest) -> EmailSubscriptionResponse:
+    status, item = await asyncio.to_thread(
+        upsert_email_subscription,
+        email=request.email,
+        latitude=request.latitude,
+        longitude=request.longitude,
+        past_hours=request.past_hours,
+        enabled=request.enabled,
+    )
+    return EmailSubscriptionResponse(status=status, subscription=asdict(item))
 
 
 @app.post("/recommend", response_model=RecommendResponse)

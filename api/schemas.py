@@ -214,3 +214,28 @@ class CoachFromPredictionResponse(BaseModel):
     model_config = ConfigDict(strict=True)
 
     coach: CoachRecommendation
+
+
+class EmailSubscriptionRequest(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+    email: str = Field(..., min_length=5, max_length=320)
+    latitude: float = Field(..., ge=-90, le=90)
+    longitude: float = Field(..., ge=-180, le=180)
+    past_hours: int = Field(default=72, ge=24, le=240)
+    enabled: bool = True
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, value: str) -> str:
+        addr = value.strip().lower()
+        if "@" not in addr or addr.startswith("@") or addr.endswith("@"):
+            raise ValueError("email must be a valid address")
+        return addr
+
+
+class EmailSubscriptionResponse(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+    status: Literal["subscribed", "updated", "unsubscribed"]
+    subscription: dict[str, Any]
