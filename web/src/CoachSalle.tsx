@@ -130,19 +130,25 @@ export function CoachSalle({
     <aside className="salle" aria-label="Anchored coach dialogue for this forecast hour">
       <div className="salle__frame">
         <div className="salle__head">
-          <span className="panel__numeral salle__numeral">IV</span>
+          <span className="salle__mark" aria-hidden>
+            ❀
+          </span>
           <div>
             <h3 className="salle__title">Salle de conseil</h3>
             <p className="salle__subtitle">
-              Counsel is anchored to the <strong>forecast hour the model used</strong> (not “right now” on your clock):
+              The coach stays inside the <strong>forecast hour this run used</strong>. That is the hour on the model’s
+              timeline, not necessarily the minute you pressed analyze.
               <span className="mono"> {refUtcDisplay}</span>
               {refLocalDisplay ? (
                 <>
                   {" "}
-                  · on this device: <span className="mono">{refLocalDisplay}</span>
+                  <span className="salle__dot" aria-hidden>
+                    ·
+                  </span>{" "}
+                  here <span className="mono">{refLocalDisplay}</span>
                 </>
-              ) : null}{" "}
-              · the verdict and weather card above are the only ground truth.
+              ) : null}
+              . The verdict and weather card above stay the source of truth.
             </p>
           </div>
         </div>
@@ -171,7 +177,7 @@ export function CoachSalle({
             </div>
 
             <p className="salle__field-hint muted small">
-              Type only in <strong>Your message</strong> below — the transcript is read-only.
+              Replies gather in the transcript. <strong>Your message</strong> is the box below.
             </p>
 
             <div className="salle__transcript-wrap">
@@ -183,7 +189,7 @@ export function CoachSalle({
                 aria-label="Conversation transcript"
               >
                 {messages.length === 0 && !busy && !streamText && (
-                  <p className="salle__thread-hint muted small">No messages yet — starters or the box below.</p>
+                  <p className="salle__thread-hint muted small">No messages yet. Pick a starter or write below.</p>
                 )}
                 {messages.map((m, i) => (
                   <div key={i} className={`salle__msg salle__msg--${m.role}`}>

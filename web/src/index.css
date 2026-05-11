@@ -1337,9 +1337,19 @@ details[open] .details-summary::after {
   margin-bottom: var(--space-3);
 }
 
-.salle__numeral {
+.salle__mark {
   flex-shrink: 0;
-  margin-top: 0.15rem;
+  margin-top: 0.1rem;
+  font-size: 1.1rem;
+  line-height: 1;
+  color: var(--gold);
+  opacity: 0.85;
+  user-select: none;
+}
+
+.salle__dot {
+  margin: 0 0.12em;
+  color: var(--muted);
 }
 
 .salle__title {
@@ -1359,7 +1369,7 @@ details[open] .details-summary::after {
   color: var(--text-soft);
   font-family: var(--font-display);
   font-style: italic;
-  max-width: 52ch;
+  max-width: 58ch;
 }
 
 .salle__field-hint {
