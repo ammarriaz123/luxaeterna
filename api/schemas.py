@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class FeatureWindowRequest(BaseModel):
@@ -214,6 +214,43 @@ class CoachFromPredictionResponse(BaseModel):
     model_config = ConfigDict(strict=True)
 
     coach: CoachRecommendation
+
+
+class CoachChatTurn(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+    role: Literal["user", "assistant"]
+    content: str = Field(..., min_length=1, max_length=4000)
+
+
+class CoachAnchoredContext(BaseModel):
+    """Frozen forecast bundle — the only ground truth for anchored dialogue."""
+
+    model_config = ConfigDict(strict=True)
+
+    latitude: float = Field(..., ge=-90, le=90)
+    longitude: float = Field(..., ge=-180, le=180)
+    reference_time_utc: str = Field(..., min_length=8, max_length=64)
+    predicted_label: str = Field(..., min_length=1, max_length=64)
+    predicted_class_id: int = Field(..., ge=0, le=3)
+    class_probabilities: list[LightingClassScore] = Field(..., min_length=1)
+    weather_snapshot: dict[str, Any] = Field(default_factory=dict)
+    coach: CoachRecommendation
+
+
+class CoachChatRequest(BaseModel):
+    """Anchored multi-turn chat: every reply must respect `context` only."""
+
+    model_config = ConfigDict(strict=True)
+
+    messages: list[CoachChatTurn] = Field(..., min_length=1, max_length=22)
+    context: CoachAnchoredContext
+
+    @model_validator(mode="after")
+    def last_turn_is_user(self) -> CoachChatRequest:
+        if self.messages[-1].role != "user":
+            raise ValueError("last message must be a user turn")
+        return self
 
 
 class EmailSubscriptionRequest(BaseModel):

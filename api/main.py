@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 
 UTC = timezone.utc
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -22,10 +23,16 @@ import joblib
 import numpy as np
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from tensorflow import keras
 
-from api.coach import build_rules_coach, maybe_enrich_coach_with_openai
+from api.coach import (
+    build_rules_coach,
+    coach_llm_available,
+    iter_anchor_chat_sse,
+    iter_coach_shooting_sse,
+    maybe_enrich_coach_with_openai,
+)
 from api.ensemble_bundle import (
     CLASS_LABELS,
     WEIGHT_LSTM,
@@ -49,6 +56,7 @@ from api.notifications import (
     upsert_email_subscription,
 )
 from api.schemas import (
+    CoachChatRequest,
     CoachFromPredictionRequest,
     CoachFromPredictionResponse,
     EmailSubscriptionRequest,
@@ -337,6 +345,7 @@ def _capabilities(state: ModelRegistry) -> dict[str, bool]:
         "lighting_event_ensemble": ensemble_on,
         "predict_event_from_location": ensemble_on,
         "shooting_coach": True,
+        "coach_llm": coach_llm_available(),
     }
 
 
@@ -429,6 +438,7 @@ async def predict_lighting_from_location(request: PredictFromLocationRequest) ->
     coach = await asyncio.to_thread(
         maybe_enrich_coach_with_openai,
         coach,
+        predicted_class_id=pred.predicted_class_id,
         class_probabilities=pred.class_probabilities,
         weather_snapshot=meta["snapshot"],
     )
@@ -455,10 +465,57 @@ async def coach_shooting(request: CoachFromPredictionRequest) -> CoachFromPredic
     coach = await asyncio.to_thread(
         maybe_enrich_coach_with_openai,
         coach,
+        predicted_class_id=request.predicted_class_id,
         class_probabilities=request.class_probabilities,
         weather_snapshot=request.weather_snapshot,
     )
     return CoachFromPredictionResponse(coach=coach)
+
+
+@app.post("/coach/shooting/stream")
+async def coach_shooting_stream(request: CoachFromPredictionRequest) -> StreamingResponse:
+    """SSE: rules coach, structured field refinements, streamed narrative tokens, final merged coach."""
+
+    def event_bytes() -> Iterator[bytes]:
+        yield from iter_coach_shooting_sse(
+            predicted_class_id=request.predicted_class_id,
+            predicted_label=request.predicted_label,
+            class_probabilities=request.class_probabilities,
+            weather_snapshot=request.weather_snapshot,
+        )
+
+    return StreamingResponse(
+        event_bytes(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/coach/chat/stream")
+async def coach_chat_stream(request: CoachChatRequest) -> StreamingResponse:
+    """Anchored Salle de conseil — multi-turn chat grounded in one forecast bundle (SSE)."""
+    if not coach_llm_available():
+        raise HTTPException(
+            status_code=503,
+            detail="Coach LLM is not enabled (set COACH_LLM=1 and OPENAI_API_KEY or GROQ_API_KEY).",
+        )
+
+    def chat_bytes() -> Iterator[bytes]:
+        yield from iter_anchor_chat_sse(request)
+
+    return StreamingResponse(
+        chat_bytes(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/notifications/email-subscription", response_model=EmailSubscriptionResponse)
